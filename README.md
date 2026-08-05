@@ -1,5 +1,7 @@
 # hyprwater
 
+You heard of Liquid Glass, now FEEL the Liquid Water
+
 Water for Hyprland windows. A real-time wave simulation rendered as liquid
 glass: windows are viewports onto one shared sheet of water. Waves propagate,
 reflect, and interfere; light refracts through the surface and lands on
