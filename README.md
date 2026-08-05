@@ -10,6 +10,8 @@ Hyprnux — the blur/refraction glass pipeline remains from there. The water is
 new: the simulation, the caustics, the fluid dynamics, and the physics that
 ties them together.
 
+[![Demo](https://img.youtube.com/vi/S1cT50VqyVo/maxresdefault.jpg)](https://youtu.be/S1cT50VqyVo)
+
 ## What it does
 
 - **Wave simulation, not animated noise.** A GPU wave-equation integrator:
