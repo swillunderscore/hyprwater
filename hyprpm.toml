@@ -1,0 +1,9 @@
+[repository]
+name = "hyprwater"
+authors = ["swillunderscore"]
+description = "Water for Hyprland windows - a real-time wave simulation rendered as liquid glass"
+
+[hyprwater]
+description = "Liquid glass with a simulated water surface"
+output = "hyprwater.so"
+build = ["make all"]
