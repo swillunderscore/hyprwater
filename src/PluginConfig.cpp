@@ -40,6 +40,10 @@ void registerConfig(HANDLE handle) {
     // Layer surface support
     addConfigValue<Config::Values::Int>(handle, ConfigKeys::LAYERS_ENABLED, Config::INTEGER{0});
     addConfigValue<Config::Values::Int>(handle, ConfigKeys::SHIMMER_ENABLED, Config::INTEGER{0});
+    addConfigValue<Config::Values::Float>(handle, ConfigKeys::ADAPTIVE_TINT, Config::FLOAT{0.0f});
+    addConfigValue<Config::Values::Int>(handle, ConfigKeys::ADAPTIVE_TINT_TERMINALS_ONLY, Config::INTEGER{0});
+    addConfigValue<Config::Values::Float>(handle, ConfigKeys::ADAPTIVE_TARGET, Config::FLOAT{0.18f});
+    addConfigValue<Config::Values::Float>(handle, ConfigKeys::ADAPTIVE_SPEED, Config::FLOAT{2.0f});
     addConfigValue<Config::Values::Float>(handle, ConfigKeys::SHIMMER_INTENSITY, Config::FLOAT{0.5f});
     addConfigValue<Config::Values::Float>(handle, ConfigKeys::SHIMMER_SPEED, Config::FLOAT{0.35f});
     addConfigValue<Config::Values::Float>(handle, ConfigKeys::SHIMMER_SCALE, Config::FLOAT{1.0f});
@@ -180,6 +184,10 @@ void initConfigPointers(HANDLE handle, SPluginConfig& config) {
 
     config.layersEnabled           = getStaticPtr<Hyprlang::INT>(handle, ConfigKeys::LAYERS_ENABLED);
     config.shimmerEnabled          = getStaticPtr<Hyprlang::INT>(handle, ConfigKeys::SHIMMER_ENABLED);
+    config.adaptiveTint            = getStaticPtr<Hyprlang::FLOAT>(handle, ConfigKeys::ADAPTIVE_TINT);
+    config.adaptiveTintTerminalsOnly = getStaticPtr<Hyprlang::INT>(handle, ConfigKeys::ADAPTIVE_TINT_TERMINALS_ONLY);
+    config.adaptiveTarget          = getStaticPtr<Hyprlang::FLOAT>(handle, ConfigKeys::ADAPTIVE_TARGET);
+    config.adaptiveSpeed           = getStaticPtr<Hyprlang::FLOAT>(handle, ConfigKeys::ADAPTIVE_SPEED);
     config.shimmerIntensity        = getStaticPtr<Hyprlang::FLOAT>(handle, ConfigKeys::SHIMMER_INTENSITY);
     config.shimmerSpeed            = getStaticPtr<Hyprlang::FLOAT>(handle, ConfigKeys::SHIMMER_SPEED);
     config.shimmerScale            = getStaticPtr<Hyprlang::FLOAT>(handle, ConfigKeys::SHIMMER_SCALE);

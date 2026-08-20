@@ -25,6 +25,13 @@ class CGlassLayerSurface {
     PHLLSREF     m_layerSurface;
     SP<Render::IFramebuffer> m_sampleFramebuffer;
     SP<Render::IFramebuffer> m_surfaceTempFramebuffer;
+    // Per-layer blur ping-pong scratch — see blurBackground(); must not be shared.
+    SP<Render::IFramebuffer> m_blurTempFramebuffer;
+    // 1x1 ping-pong holding this layer's time-smoothed average backdrop luma.
+    // A fragment shader has no memory between frames; this is that memory.
+    SP<Render::IFramebuffer> m_lumaFb[2];
+    int  m_lumaCurrent = 0;
+    bool m_lumaSeeded  = false;
     Vector2D     m_samplePaddingRatio;
     bool         m_hasCachedSample = false;
 

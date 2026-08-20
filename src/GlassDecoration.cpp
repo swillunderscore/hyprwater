@@ -95,6 +95,22 @@ void CGlassDecoration::draw(PHLMONITOR monitor, float const& alpha) {
     if (!g_pGlobalState || !resolveEnabled())
         return;
 
+    // With the adaptive dim on, the glass must redraw WHOLE every frame. Damage
+    // only re-renders part of it, so the rest keeps pixels rendered at an
+    // earlier moment — and the compositor alternates swapchain buffers holding
+    // those two moments. Undimmed the two are near enough to be invisible;
+    // dimming widens the gap between them and the boundary row visibly toggles
+    // between two values. Costs a full redraw per frame (~3% GPU here) and buys
+    // a stable edge.
+    if (const auto& adCfg = g_pGlobalState->config;
+        adCfg.adaptiveTint && **adCfg.adaptiveTint > 0.001f) {
+        const bool termOnly =
+            adCfg.adaptiveTintTerminalsOnly && **adCfg.adaptiveTintTerminalsOnly;
+        const auto w = m_window.lock();
+        if (!termOnly || !w || isTerminalClass(w->m_class))
+            damageEntire();
+    }
+
     CGlassPassElement::SGlassPassData data{m_self, alpha};
     g_pHyprRenderer->m_renderPass.add(makeUnique<CGlassPassElement>(data));
 
@@ -136,16 +152,21 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
         return;
 
     const auto window = m_window.lock();
-    if (!window)
+    if (!window) {
+        GlassRenderer::DBG_LOG("RP bail=nowindow\n");
         return;
-
+    }
     const auto source = g_pHyprRenderer->m_renderData.currentFB;
-    if (!source)
+    if (!source) {
+        GlassRenderer::DBG_LOG("RP win=%lx bail=nosource\n", reinterpret_cast<uintptr_t>(window.get()));
         return;
+    }
 
     auto optBox = WindowGeometry::computeWindowBox(window, monitor);
-    if (!optBox)
+    if (!optBox) {
+        GlassRenderer::DBG_LOG("RP win=%lx bail=nobox\n", reinterpret_cast<uintptr_t>(window.get()));
         return;
+    }
 
     CBox windowBox    = *optBox;
     CBox transformBox = windowBox;
@@ -161,7 +182,7 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
     const SResolveContext ctx  = {preset, isDark, g_pGlobalState->config, g_pGlobalState->customPresets};
 
     float blurStrength   = resolvePresetFloat(ctx, &SPresetValues::blurStrength, &SOverridableConfig::blurStrength);
-    int downscale        = blurStrength >= GlassRenderer::BLUR_DOWNSCALE_THRESHOLD ? GlassRenderer::BLUR_DOWNSCALE_MAX : 1;
+    int downscale        = GlassRenderer::blurDownscale(blurStrength);
 
     GlassRenderer::sampleBackground(m_sampleFramebuffer, source, transformBox, m_samplePaddingRatio, downscale);
 
@@ -169,7 +190,29 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
     int blurIterations   = std::clamp(static_cast<int>(resolvePresetInt(ctx, &SPresetValues::blurIterations, &SOverridableConfig::blurIterations)), 1, 5);
     int viewportWidth    = static_cast<int>(g_pHyprRenderer->m_renderData.pMonitor->m_transformedSize.x);
     int viewportHeight   = static_cast<int>(g_pHyprRenderer->m_renderData.pMonitor->m_transformedSize.y);
-    GlassRenderer::blurBackground(m_sampleFramebuffer, blurRadius, blurIterations, dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(), viewportWidth, viewportHeight);
+    GlassRenderer::blurBackground(m_sampleFramebuffer, m_blurTempFramebuffer, blurRadius, blurIterations, dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(), viewportWidth, viewportHeight);
+
+    // One time-smoothed average for the whole window, so the dim is uniform and
+    // does not pump with an animated wallpaper.
+    const auto& lumaCfg = g_pGlobalState->config;
+    const bool adaptiveAllowed =
+        !(lumaCfg.adaptiveTintTerminalsOnly && **lumaCfg.adaptiveTintTerminalsOnly) ||
+        isTerminalClass(window->m_class);
+    SP<Render::IFramebuffer> adaptiveLumaFb = m_lumaFb[m_lumaCurrent];
+    if (adaptiveAllowed) {
+        GlassRenderer::updateAdaptiveLuma(m_sampleFramebuffer, m_lumaFb, m_lumaCurrent, m_lumaSeeded,
+                                          dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(),
+                                          viewportWidth, viewportHeight);
+    } else {
+        adaptiveLumaFb = nullptr;
+    }
+
+    GlassRenderer::DBG_LOG("RP win=%lx alpha=%.3f BLURRED str=%.2f rad=%.2f it=%d sample=%.0fx%.0f srcfb=%u box=%.0f,%.0f %.0fx%.0f\n",
+                           reinterpret_cast<uintptr_t>(window.get()), alpha, blurStrength, blurRadius, blurIterations,
+                           m_sampleFramebuffer ? m_sampleFramebuffer->m_size.x : -1.0,
+                           m_sampleFramebuffer ? m_sampleFramebuffer->m_size.y : -1.0,
+                           dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(),
+                           windowBox.x, windowBox.y, windowBox.width, windowBox.height);
 
     float monitorScale  = monitor->m_scale;
     float cornerRadius  = window->rounding() * monitorScale;
@@ -177,7 +220,8 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
 
     GlassRenderer::applyGlassEffect(m_sampleFramebuffer, source,
                                      windowBox, transformBox, alpha,
-                                     cornerRadius, roundingPower, m_samplePaddingRatio, ctx);
+                                     cornerRadius, roundingPower, m_samplePaddingRatio, ctx,
+                                     nullptr, adaptiveLumaFb);
 }
 
 eDecorationType CGlassDecoration::getDecorationType() {

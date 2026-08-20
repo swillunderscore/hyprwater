@@ -35,6 +35,9 @@ struct SGlassUniforms {
     GLint uvPadding = -1;
     GLint tintColor = -1;
     GLint tintAlpha = -1;
+    GLint adaptiveTint = -1;
+    GLint adaptiveTarget = -1;
+    GLint adaptiveLumaTex = -1;
     GLint lensDistortion = -1;
     GLint saturation = -1;
     GLint brightness = -1;
@@ -50,6 +53,12 @@ struct SGlassUniforms {
     GLint maskUVOffset = -1;
     GLint maskUVScale = -1;
     GLint maskAlphaThreshold = -1;
+};
+
+struct SAdaptiveLumaUniforms {
+    GLint prevTex   = -1;
+    GLint emaAlpha  = -1;
+    GLint seedPrev  = -1;
 };
 
 struct SBlurUniforms {
@@ -115,6 +124,9 @@ class CShaderManager {
     SP<CShader>    blurShader = makeShared<CShader>();
     SBlurUniforms  blurUniforms;
 
+    SP<CShader>           adaptiveLumaShader = makeShared<CShader>();
+    SAdaptiveLumaUniforms adaptiveLumaUniforms;
+
     SP<CShader>      waveSimShader = makeShared<CShader>();
     SWaveSimUniforms waveSimUniforms;
 
@@ -136,6 +148,7 @@ class CShaderManager {
     [[nodiscard]] static std::string loadShaderSource(const char* fileName);
     [[nodiscard]] bool compileGlassShader();
     [[nodiscard]] bool compileBlurShader();
+    [[nodiscard]] bool compileAdaptiveLumaShader();
     [[nodiscard]] bool compileWaveSimShader();
     [[nodiscard]] bool compileFluidShaders();
     [[nodiscard]] bool compileTrailShader();

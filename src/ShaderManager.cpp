@@ -60,6 +60,9 @@ bool CShaderManager::compileGlassShader() {
     glassUniforms.uvPadding           = glGetUniformLocation(program, "uvPadding");
     glassUniforms.tintColor           = glGetUniformLocation(program, "tintColor");
     glassUniforms.tintAlpha           = glGetUniformLocation(program, "tintAlpha");
+    glassUniforms.adaptiveTint         = glGetUniformLocation(program, "adaptiveTint");
+    glassUniforms.adaptiveTarget       = glGetUniformLocation(program, "adaptiveTarget");
+    glassUniforms.adaptiveLumaTex      = glGetUniformLocation(program, "adaptiveLumaTex");
     glassUniforms.lensDistortion      = glGetUniformLocation(program, "lensDistortion");
     glassUniforms.saturation          = glGetUniformLocation(program, "saturation");
     glassUniforms.brightness          = glGetUniformLocation(program, "brightness");
@@ -74,6 +77,24 @@ bool CShaderManager::compileGlassShader() {
     glassUniforms.maskUVScale         = glGetUniformLocation(program, "maskUVScale");
     glassUniforms.maskAlphaThreshold  = glGetUniformLocation(program, "maskAlphaThreshold");
 
+    return true;
+}
+
+bool CShaderManager::compileAdaptiveLumaShader() {
+    if (!adaptiveLumaShader->createProgram(
+            g_pHyprOpenGL->m_shaders->TEXVERTSRC,
+            loadShaderSource("adaptiveluma.frag"),
+            true
+        )) {
+        HyprlandAPI::addNotification(PHANDLE,
+            std::format("[{}] Failed to compile adaptive luma shader", PLUGIN_NAME),
+            CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
+        return false;
+    }
+    const auto program = adaptiveLumaShader->program();
+    adaptiveLumaUniforms.prevTex  = glGetUniformLocation(program, "prevTex");
+    adaptiveLumaUniforms.emaAlpha = glGetUniformLocation(program, "emaAlpha");
+    adaptiveLumaUniforms.seedPrev = glGetUniformLocation(program, "seedPrev");
     return true;
 }
 
@@ -215,6 +236,9 @@ void CShaderManager::initializeIfNeeded() {
         return;
 
     if (!compileBlurShader())
+        return;
+
+    if (!compileAdaptiveLumaShader())
         return;
 
     if (!compileWaveSimShader())

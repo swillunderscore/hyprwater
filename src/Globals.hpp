@@ -24,8 +24,14 @@ struct SGlobalState {
     // User-defined presets (populated from config keyword, swapped in on configReloaded)
     std::unordered_map<std::string, SCustomPreset> customPresets;
 
-    // Shared blur temp framebuffer (reused across all decorations since they render sequentially)
-    SP<Render::IFramebuffer> blurTempFramebuffer;
+    // NOTE: the blur ping-pong scratch buffer used to live here, shared by every
+    // decoration "since they render sequentially". Sequentially is true and not
+    // enough: the buffer is sized to the window being blurred, so with windows of
+    // DIFFERENT sizes on screen it reallocates for each one, every frame, and only
+    // whichever window it currently matches comes out blurred. Focusing a floating
+    // window raises it, which changes render order, which changes who wins — so the
+    // blur appeared to hop between windows and never landed on the focused one.
+    // It is now a per-decoration member (m_blurTempFramebuffer), like m_sampleFramebuffer.
 
     // Wave simulation state. Two framebuffers ping-ponged one step per frame;
     // this is the whole reason the surface can be non-stationary — the field

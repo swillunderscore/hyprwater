@@ -159,11 +159,50 @@ void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IF
     glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbId(sourceFramebuffer));
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbId(sampleFramebuffer));
-    glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1,
-                      dstX0, dstY0, dstX1, dstY1,
-                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    // TWO-STEP REDUCTION. GL_LINEAR averages exactly 2x2 texels, which is the
+    // correct box filter for a 2x reduction and NOT correct for anything larger:
+    // a single 4x blit reads a 2x2 box out of a 4x4 footprint and discards 12 of
+    // every 16 source pixels. Undersampled text aliases into axis-aligned moire,
+    // and since the sample phase is srcX0 = box.x - pad, that moire crawls
+    // whenever the window moves and freezes the moment it stops -- which is
+    // exactly how the artifact presented. Composing two exact 2x steps gives a
+    // correct 4x4 average at the same final resolution, so quarter-res keeps its
+    // fill-rate saving without the aliasing.
+    if (downscale >= 4) {
+        static SP<Render::IFramebuffer> halfFramebuffer;
+        const int halfWidth  = std::max(1, sampleWidth  * 2);
+        const int halfHeight = std::max(1, sampleHeight * 2);
+        if (!halfFramebuffer)
+            halfFramebuffer = g_pHyprRenderer->createFB("hyprwater-sample-half");
+        if (halfFramebuffer->m_size.x != halfWidth || halfFramebuffer->m_size.y != halfHeight)
+            halfFramebuffer->alloc(halfWidth, halfHeight, sourceFramebuffer->m_drmFormat);
+
+        // Step 1: source -> half res. The destination rect is the final one
+        // scaled by two, so this step is exactly 2x and the clipping math above
+        // carries over unchanged.
+        glBindFramebuffer(GL_FRAMEBUFFER, fbId(halfFramebuffer));
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbId(sourceFramebuffer));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbId(halfFramebuffer));
+        glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1,
+                          dstX0 * 2, dstY0 * 2, dstX1 * 2, dstY1 * 2,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+        // Step 2: half res -> final. Whole surface to whole surface, so this is
+        // exactly 2x again and the content keeps its position.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbId(halfFramebuffer));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbId(sampleFramebuffer));
+        glBlitFramebuffer(0, 0, halfWidth, halfHeight,
+                          0, 0, sampleWidth, sampleHeight,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    } else {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fbId(sourceFramebuffer));
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbId(sampleFramebuffer));
+        glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1,
+                          dstX0, dstY0, dstX1, dstY1,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    }
     if (smpScissor)
         glEnable(GL_SCISSOR_TEST);
 }
@@ -503,7 +542,7 @@ static void stepFluidFrame() {
     glBindVertexArray(0);
     glActiveTexture(GL_TEXTURE0);
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    g_pHyprOpenGL->setViewport(0, 0, prevVp[2], prevVp[3]);
+    g_pHyprOpenGL->setViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
 }
 
 // ---- Mouse wake ----------------------------------------------------------
@@ -684,7 +723,7 @@ void renderTrailTex() {
     g_pHyprOpenGL->setCapStatus(GL_BLEND, true);
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    g_pHyprOpenGL->setViewport(0, 0, prevVp[2], prevVp[3]);
+    g_pHyprOpenGL->setViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
 }
 
 // Render the caustic illumination into its own texture, once per FRAME, and
@@ -886,9 +925,37 @@ static void renderCausticTex() {
     if (prevScissor)
         glEnable(GL_SCISSOR_TEST);
     glBindVertexArray(0);
-    glActiveTexture(GL_TEXTURE0);
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    g_pHyprOpenGL->setViewport(0, 0, prevVp[2], prevVp[3]);
+
+    // MIP CHAIN FOR THE CAUSTIC — this is the flickering rim on glass windows.
+    //
+    // The glass samples this texture at the REFRACTED coordinate, and the dome
+    // refraction is steepest in the outermost columns: there the sample
+    // coordinate walks many texels per screen pixel, so a single GL_LINEAR tap
+    // lands on an essentially arbitrary filament of a high-frequency 1024²
+    // field — and on a DIFFERENT one every time the water moves. That is
+    // minification aliasing, and its signature is exactly temporal: the rim
+    // flickers while the interior, where the coordinate advances about one
+    // texel per pixel, sits perfectly still. Measured on an unfocused window's
+    // outermost column: 0.0 swing with shimmer off, 25.3 with it on, and 0.0
+    // again with shimmer on but its intensity at zero — the caustic term alone.
+    //
+    // A mip chain is the fix the sampler already knows how to apply. The
+    // hardware measures the coordinate's own derivative per pixel and reads a
+    // PRE-AVERAGED level wherever the sample is minified, which is the average
+    // that column was always meant to be showing. The interior still selects
+    // mip 0, so nothing there changes.
+    //
+    // Generated only after the FBO is unbound: this texture is the pass's own
+    // colour attachment, and writing its mips while it is still attached is a
+    // feedback loop.
+    if (fb->getTexture()) {
+        glActiveTexture(GL_TEXTURE7);
+        fb->getTexture()->bind();
+        glGenerateMipmap(GL_TEXTURE_2D);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    g_pHyprOpenGL->setViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
 }
 
 void stepWaveSim() {
@@ -1261,7 +1328,12 @@ void stepWaveSim() {
                 // Outer ring only: the shader samples just the middle of the
                 // sim, so these are genuinely off-screen and travel inward.
                 const float ang = fr(16) * 6.2831853f;
-                const float rr  = 0.40f + 0.09f * fr(32);
+                // Ring moved in from 0.40-0.49 to make room for the absorbing band added in
+                // wavesim.frag. At 0.40 the ring's outer edge sat at uv 0.01 - one
+                // percent from a reflecting wall - so half of every injected wave
+                // bounced straight back and stood against the inbound half.
+                // Waves still cross ~0.24 uv before reaching the visible radius (0.105).
+                const float rr  = 0.29f + 0.09f * fr(32);
                 const float rad = 0.025f + 0.050f * std::clamp(thick, 0.0f, 1.0f) + 0.020f * fr(40);
                 // Calm water is disturbed more GENTLY, not merely less often;
                 // and SELF-LIMITING by the energy already in flight — real
@@ -1382,11 +1454,100 @@ void stepWaveSim() {
     // leaving the sim's 512x512 viewport bound would scissor the glass pass down
     // to a corner of the screen.
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
-    g_pHyprOpenGL->setViewport(0, 0, prevVp[2], prevVp[3]);
+    g_pHyprOpenGL->setViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
 
 }
 
-void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, float radius, int iterations,
+void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer,
+                        SP<Render::IFramebuffer> lumaFb[2], int& current, bool& seeded,
+                        GLuint callerFramebufferID, int viewportWidth, int viewportHeight) {
+    auto& sm = g_pGlobalState->shaderManager;
+    if (!sampleFramebuffer || !sm.isInitialized())
+        return;
+
+    for (int i = 0; i < 2; i++) {
+        if (!lumaFb[i])
+            lumaFb[i] = g_pHyprRenderer->createFB("hyprwater-adaptive-luma");
+        if (lumaFb[i]->m_size.x != 1 || lumaFb[i]->m_size.y != 1)
+            lumaFb[i]->alloc(1, 1, DRM_FORMAT_ABGR16161616F);
+        if (!lumaFb[i]->getTexture() || fbId(lumaFb[i]) == 0)
+            return;
+    }
+
+    const int prev = current;
+    const int next = 1 - current;
+
+    // Frame delta -> EMA weight, so the settle time is the same whatever the
+    // compositor is running at. Clamped: a long stall must not snap the value.
+    //
+    // PER FRAMEBUFFER, not one static clock. A single shared timestamp gets
+    // consumed by whichever glass surface renders first; every other surface in
+    // the same frame then sees dt~0 and its average stops advancing. Which
+    // surface wins depends on render order, and focusing a window changes that
+    // order — so the smoothing rate silently depended on which window you last
+    // clicked.
+    static std::unordered_map<const void*, std::chrono::steady_clock::time_point> lastSeen;
+    const auto  key = static_cast<const void*>(lumaFb[0].get());
+    const auto  now = std::chrono::steady_clock::now();
+    float dt = 1.0f / 60.0f;
+    if (auto it = lastSeen.find(key); it != lastSeen.end())
+        dt = std::clamp(std::chrono::duration<float>(now - it->second).count(), 0.0f, 0.25f);
+    lastSeen[key] = now;
+
+    const auto& cfg = g_pGlobalState->config;
+    const float tau = cfg.adaptiveSpeed ? std::max(0.01f, static_cast<float>(**cfg.adaptiveSpeed)) : 2.0f;
+    const float alpha = 1.0f - std::exp(-dt / tau);
+
+    // Offscreen pass: the render pass's damage scissor is in monitor coords and
+    // would discard a 1x1 draw entirely. Same trap as blurBackground().
+    const GLboolean hadScissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
+    auto shader = g_pHyprOpenGL->useShader(sm.adaptiveLumaShader);
+    static constexpr std::array<float, 9> PROJ = {
+        2.0f, 0.0f, 0.0f,
+        0.0f, 2.0f, 0.0f,
+       -1.0f,-1.0f, 1.0f,
+    };
+    shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_FALSE, PROJ);
+    shader->setUniformInt(SHADER_TEX, 0);
+    glUniform1i(sm.adaptiveLumaUniforms.prevTex, 1);
+    glUniform1f(sm.adaptiveLumaUniforms.emaAlpha, alpha);
+    glUniform1f(sm.adaptiveLumaUniforms.seedPrev, seeded ? 1.0f : 0.0f);
+
+    glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
+    glBindFramebuffer(GL_FRAMEBUFFER, fbId(lumaFb[next]));
+    g_pHyprOpenGL->setViewport(0, 0, 1, 1);
+
+    glActiveTexture(GL_TEXTURE0);
+    sampleFramebuffer->getTexture()->bind();
+    // Build the mip chain so the shader can read the whole-window average from
+    // the 1x1 level. Needs a mipmap min-filter to be sampled; put it back to
+    // LINEAR afterwards because applyGlassEffect samples this same texture and
+    // expects no mip selection.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glActiveTexture(GL_TEXTURE1);
+    lumaFb[prev]->getTexture()->bind();
+
+    g_pHyprOpenGL->setCapStatus(GL_BLEND, false);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glActiveTexture(GL_TEXTURE0);
+    sampleFramebuffer->getTexture()->bind();
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glBindVertexArray(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, callerFramebufferID);
+    g_pHyprOpenGL->setViewport(0, 0, viewportWidth, viewportHeight);
+    if (hadScissor)
+        glEnable(GL_SCISSOR_TEST);
+
+    current = next;
+    seeded  = true;
+}
+
+void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFramebuffer>& tempFramebuffer,
+                    float radius, int iterations,
                     GLuint callerFramebufferID, int viewportWidth, int viewportHeight) {
     auto& shaderManager = g_pGlobalState->shaderManager;
     if (!sampleFramebuffer || radius <= 0.0f || iterations <= 0 || !shaderManager.isInitialized())
@@ -1395,7 +1556,11 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, float radius, in
     int width  = static_cast<int>(sampleFramebuffer->m_size.x);
     int height = static_cast<int>(sampleFramebuffer->m_size.y);
 
-    auto& blurTempFramebuffer = g_pGlobalState->blurTempFramebuffer;
+    // The caller's own scratch, sized to the caller's own sample. When this was
+    // one global buffer it was resized by whichever window blurred last, so a
+    // desktop of differently-sized windows reallocated it every window every
+    // frame and the blur only ever came out right for one of them.
+    auto& blurTempFramebuffer = tempFramebuffer;
     if (!blurTempFramebuffer)
         blurTempFramebuffer = g_pHyprRenderer->createFB("hyprwater-blur-temp");
 
@@ -1419,6 +1584,36 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, float radius, in
     g_pHyprOpenGL->setViewport(0, 0, width, height);
     glActiveTexture(GL_TEXTURE0);
 
+    if (dbgLog()) {
+        // Is a leftover scissor from the render pass (or a previous window's
+        // composite) clipping these fullscreen quads inside the small sample FB?
+        GLint sb[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_SCISSOR_BOX, sb);
+        GLint vp[4] = {0, 0, 0, 0};
+        glGetIntegerv(GL_VIEWPORT, vp);
+        DBG("%.4f BLURFB sample=%d(%.0fx%.0f) temp=%d rad=%.2f it=%d scissor=%d[%d,%d %dx%d] vp=[%d,%d %dx%d]\n",
+            dbgNow(), fbId(sampleFramebuffer), sampleFramebuffer->m_size.x, sampleFramebuffer->m_size.y,
+            fbId(blurTempFramebuffer), radius, iterations,
+            glIsEnabled(GL_SCISSOR_TEST) ? 1 : 0, sb[0], sb[1], sb[2], sb[3],
+            vp[0], vp[1], vp[2], vp[3]);
+    }
+
+    // The render pass leaves a damage-rect scissor enabled, in MONITOR
+    // coordinates. The quads below are fullscreen draws into a sample FB that is
+    // a few hundred pixels across, so a rect like [1246,1073 925x16] doesn't
+    // clip the blur — it lands entirely outside the target and throws the whole
+    // pass away. The sample then composites exactly as sampled: unblurred.
+    //
+    // Only the first glassed window on a monitor happens to run with the scissor
+    // off, so precisely one window per monitor got a blur. Focusing a floating
+    // window raises it, which renders it later, which is why it was never the
+    // focused one and why the blur hopped as you clicked between windows.
+    //
+    // sampleBackground(), the wave sim and applyGlassEffect all already guard
+    // this. blurBackground was the one offscreen pass that never did.
+    const GLboolean blurScissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
     // Ping-pong at full resolution: sampleFramebuffer ↔ blurTempFramebuffer
     for (int iteration = 0; iteration < iterations; iteration++) {
         // Horizontal pass: sampleFramebuffer → blurTempFramebuffer
@@ -1434,6 +1629,9 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, float radius, in
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
 
+    if (blurScissor)
+        glEnable(GL_SCISSOR_TEST);
+
     // Restore caller's GL state without querying (avoids pipeline stalls)
     glBindFramebuffer(GL_FRAMEBUFFER, callerFramebufferID);
     glBindVertexArray(0);
@@ -1444,7 +1642,7 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
                        CBox& rawBox, CBox& transformedBox,
                        float alpha, float cornerRadius, float roundingPower,
                        const Vector2D& paddingRatio, const SResolveContext& resolveContext,
-                       const SMaskInfo* mask) {
+                       const SMaskInfo* mask, SP<Render::IFramebuffer> adaptiveLumaFb) {
     // ONE scissor guard for the ENTIRE effect, raw GL, not the compositor's
     // cached cap wrapper (the cache can disagree with real state and skip the
     // disable). The render pass leaves a damage-rect scissor enabled; every
@@ -1762,7 +1960,9 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
             if (auto& cfb = g_pGlobalState->causticFb; cfb && cfb->getTexture()) {
                 glActiveTexture(GL_TEXTURE7);
                 cfb->getTexture()->bind();
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                // Trilinear on minification so the mip chain built at the end
+                // of renderCausticTex actually gets used — see the note there.
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -1793,6 +1993,22 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
         static_cast<float>((tintColorValue >> 8) & 0xFF) / 255.0f);
     glUniform1f(uniforms.tintAlpha,
         static_cast<float>(tintColorValue & 0xFF) / 255.0f);
+    {
+        const auto& cfgAd = g_pGlobalState->config;
+        // No 1x1 luma yet (first frame, or alloc failed) means no trustworthy
+        // window average — leave the glass alone rather than guess at a dim.
+        const bool haveLuma = adaptiveLumaFb && adaptiveLumaFb->getTexture();
+        glUniform1f(uniforms.adaptiveTint,
+            (haveLuma && cfgAd.adaptiveTint) ? static_cast<float>(**cfgAd.adaptiveTint) : 0.0f);
+        glUniform1f(uniforms.adaptiveTarget,
+            cfgAd.adaptiveTarget ? static_cast<float>(**cfgAd.adaptiveTarget) : 0.18f);
+        glUniform1i(uniforms.adaptiveLumaTex, 4);
+        if (haveLuma) {
+            glActiveTexture(GL_TEXTURE4);
+            adaptiveLumaFb->getTexture()->bind();
+            glActiveTexture(GL_TEXTURE0);
+        }
+    }
     if (dbgLog()) {
         // Read BACK the effective program state right before the draw: any
         // mismatch means something rewrote a uniform after the upload above,
@@ -1855,7 +2071,47 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
 
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
     g_pHyprOpenGL->scissor(rawBox);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    // PIN THE BLEND FUNCTION FOR THE COMPOSITE — this is the flickering edge
+    // pixel on glassed windows.
+    //
+    // The shader outputs PREMULTIPLIED alpha, so the one correct func is
+    // (ONE, ONE_MINUS_SRC_ALPHA). But this draw ran with whatever func was
+    // ambient — and the offscreen passes above (mouse wake, caustic, trail)
+    // are THROTTLED, so on frames where one of them ran, the ambient func at
+    // this point differed from frames where none did. Premultiplied and
+    // straight blending agree EXACTLY wherever alpha is 1 — the whole window
+    // interior — and disagree only where alpha < 1: the single antialiased
+    // boundary pixel. Which is precisely what was measured: a 1px edge column
+    // flipping between two values while the interior stayed bit-identical,
+    // rate-locked to the 14ms pass throttle (never with the water off, always
+    // with the throttle at 0.6s, rock-stable with the passes forced to every
+    // frame), immune to zeroing every water term, to freezing the sim, and to
+    // full-monitor damage — because it was never the water's CONTENT, it was
+    // the blend state its passes left behind.
+    //
+    // Raw GL, not the compositor's cached wrapper, for the same reason as the
+    // scissor guard at the top. Saved and restored so the rest of the frame
+    // sees exactly the state it would have without us.
+    {
+        GLint pSrcRGB = 0, pDstRGB = 0, pSrcA = 0, pDstA = 0;
+        glGetIntegerv(GL_BLEND_SRC_RGB,   &pSrcRGB);
+        glGetIntegerv(GL_BLEND_DST_RGB,   &pDstRGB);
+        glGetIntegerv(GL_BLEND_SRC_ALPHA, &pSrcA);
+        glGetIntegerv(GL_BLEND_DST_ALPHA, &pDstA);
+        const GLboolean pOn = glIsEnabled(GL_BLEND);
+        if (dbgLog())
+            DBG("BLENDSTATE on=%d src=%x dst=%x srcA=%x dstA=%x\n",
+                (int)pOn, pSrcRGB, pDstRGB, pSrcA, pDstA);
+
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        glBlendFuncSeparate(pSrcRGB, pDstRGB, pSrcA, pDstA);
+        if (!pOn)
+            glDisable(GL_BLEND);
+    }
     if (dbgLog()) {
         // The draw just landed in fbId(targetFramebuffer). Read one pixel of
         // what was actually written: if this stays dark while the SCREEN

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <typeinfo>
 #include <unordered_map>
+#include <unordered_set>
 
 inline constexpr std::string_view CONFIG_PREFIX = "plugin:hyprwater:";
 
@@ -45,6 +46,19 @@ inline constexpr auto SPECULAR_STRENGTH    = "plugin:hyprwater:specular_strength
 inline constexpr auto GLASS_OPACITY        = "plugin:hyprwater:glass_opacity";
 inline constexpr auto EDGE_THICKNESS       = "plugin:hyprwater:edge_thickness";
 inline constexpr auto TINT_COLOR           = "plugin:hyprwater:tint_color";
+// Per-pixel adaptive tint: where the backdrop showing through the glass is
+// bright, tint just enough to bring it down to `adaptive_target` luma; where it
+// is already dark, no tint at all. 0 disables (the static tint_alpha still
+// applies). This is the passive/live replacement for polling the screen.
+inline constexpr auto ADAPTIVE_TINT          = "plugin:hyprwater:adaptive_tint";
+inline constexpr auto ADAPTIVE_TARGET        = "plugin:hyprwater:adaptive_target";
+// Restrict adaptive tint to terminal windows (by WM class). 1 = terminals
+// only, 0 = all windows (default, prior behaviour).
+inline constexpr auto ADAPTIVE_TINT_TERMINALS_ONLY = "plugin:hyprwater:adaptive_tint_terminals_only";
+// Seconds for the dim to settle. Animated wallpapers move the window average
+// every frame; without this the dim pumps with the animation. ~2s reads as the
+// eye adjusting rather than the picture flickering.
+inline constexpr auto ADAPTIVE_SPEED         = "plugin:hyprwater:adaptive_speed";
 inline constexpr auto LENS_DISTORTION      = "plugin:hyprwater:lens_distortion";
 inline constexpr auto BRIGHTNESS           = "plugin:hyprwater:brightness";
 inline constexpr auto CONTRAST             = "plugin:hyprwater:contrast";
@@ -116,6 +130,16 @@ inline constexpr auto LIGHT_ADAPTIVE_DIM          = "plugin:hyprwater:light:adap
 inline constexpr auto LIGHT_ADAPTIVE_BOOST        = "plugin:hyprwater:light:adaptive_boost";
 
 } // namespace ConfigKeys
+
+// Built-in terminal WM classes for the adaptive_tint_terminals_only restriction.
+inline bool isTerminalClass(const std::string& cls) {
+    static const std::unordered_set<std::string> terminals = {
+        "kitty", "alacritty", "wezterm", "foot", "konsole",
+        "xfce4-terminal", "gnome-terminal-server", "xterm", "st",
+        "urxvt", "terminator", "warp", "qterminal", "tilix"
+    };
+    return terminals.count(cls) != 0;
+}
 
 // Cached pointers for a single config layer (built-in dark/light/global)
 struct SOverridableConfig {
@@ -196,6 +220,10 @@ struct SPluginConfig {
 
     Hyprlang::INT* const* layersEnabled                  = nullptr;
     Hyprlang::INT* const*   shimmerEnabled              = nullptr;
+    Hyprlang::FLOAT* const* adaptiveTint                = nullptr;
+    Hyprlang::FLOAT* const* adaptiveTarget              = nullptr;
+    Hyprlang::FLOAT* const* adaptiveSpeed               = nullptr;
+    Hyprlang::INT* const*   adaptiveTintTerminalsOnly   = nullptr;
     Hyprlang::FLOAT* const* shimmerIntensity            = nullptr;
     Hyprlang::FLOAT* const* shimmerSpeed                = nullptr;
     Hyprlang::FLOAT* const* shimmerScale                = nullptr;
