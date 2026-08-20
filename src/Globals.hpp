@@ -37,6 +37,17 @@ struct SGlobalState {
     // this is the whole reason the surface can be non-stationary — the field
     // has HISTORY, which no closed-form sum of oscillators has.
     SP<Render::IFramebuffer> waveFb[2];
+    // BAND-LIMITED COPY of the height field, for the refraction warp only.
+    // The warp folds the backdrop over itself wherever the surface curvature
+    // exceeds 1/k, and curvature lives at the shortest wavelengths — so the
+    // warp reads a Gaussian-reduced surface while the caustic keeps the sharp
+    // one. waveHalfFb is the intermediate of the two-step 4x reduction (a
+    // single 4x LINEAR blit averages 2x2 out of a 4x4 footprint and aliases —
+    // the same lesson as the backdrop sampler), waveSmoothTmpFb the separable
+    // blur's ping-pong target.
+    SP<Render::IFramebuffer> waveHalfFb;
+    SP<Render::IFramebuffer> waveSmoothFb;
+    SP<Render::IFramebuffer> waveSmoothTmpFb;
     int      waveCurrent   = 0;
     uint64_t waveStepCount = 0;
     float    waveSubFrac   = 0.0f;   // 0..1 between the last two sim states

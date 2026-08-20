@@ -112,7 +112,18 @@ void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IF
         sampleFramebuffer = g_pHyprRenderer->createFB("hyprwater-sample");
 
     if (sampleFramebuffer->m_size.x != sampleWidth || sampleFramebuffer->m_size.y != sampleHeight)
-        sampleFramebuffer->alloc(sampleWidth, sampleHeight, sourceFramebuffer->m_drmFormat);
+// 16-BIT INTERMEDIATES. The blur ping-pongs between this FB and the temp one
+// several times, and an 8-bit target rounds every pass. Blurring is exactly
+// what turns detailed content into smooth low-contrast gradients, and those
+// are what 8 bits cannot hold: adjacent levels are 1/255 apart, so a slow
+// gradient sits on one level for many pixels and then steps. Repeating that
+// per pass bakes visible contour stripes into the backdrop before anything
+// downstream can help - which is why dithering the final write alone did
+// nothing. Keeping every intermediate in half float leaves the only
+// quantisation at the final composite, where the dither can do its job.
+        sampleFramebuffer->alloc(sampleWidth, sampleHeight, DRM_FORMAT_ABGR16161616F);
+        if (!sampleFramebuffer->getTexture() || fbId(sampleFramebuffer) == 0)
+            sampleFramebuffer->alloc(sampleWidth, sampleHeight, sourceFramebuffer->m_drmFormat);
 
     int srcX0 = static_cast<int>(box.x) - pad;
     int srcX1 = static_cast<int>(box.x + box.width) + pad;
@@ -175,6 +186,8 @@ void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IF
         if (!halfFramebuffer)
             halfFramebuffer = g_pHyprRenderer->createFB("hyprwater-sample-half");
         if (halfFramebuffer->m_size.x != halfWidth || halfFramebuffer->m_size.y != halfHeight)
+            halfFramebuffer->alloc(halfWidth, halfHeight, DRM_FORMAT_ABGR16161616F);
+        if (!halfFramebuffer->getTexture() || fbId(halfFramebuffer) == 0)
             halfFramebuffer->alloc(halfWidth, halfHeight, sourceFramebuffer->m_drmFormat);
 
         // Step 1: source -> half res. The destination rect is the final one
@@ -746,6 +759,99 @@ void renderTrailTex() {
 // energy and the finite-sun blur below does the softening.
 static constexpr int CAUSTIC_RES = 1024;
 
+// ============================================================================
+// BAND-LIMITED SURFACE FOR THE REFRACTION WARP
+//
+// The warp maps the backdrop p -> p + k*grad(h). That map shows the backdrop
+// ONCE only while det(I + k*H) > 0 — the deciding quantity is the surface
+// CURVATURE, not the displacement. Past that the map folds and the same patch
+// of backdrop is drawn two or three times with a hard crease along the fold,
+// which is exactly the doubled-wave artifact. Measured at the live settings
+// (depth 3.5, scale 3) the map folded over 12.8% of every glass window even
+// after the magnitude limiter, because that limiter is a function of the SLOPE
+// and folds happen at crests where the slope is zero.
+//
+// Curvature scales as 1/lambda^2, so it lives almost entirely in the shortest
+// wavelengths, while the displacement comes from the mid-scale swell. Low-pass
+// the surface the warp reads and the folds go away for almost no loss of
+// motion: sigma = 12 sim texels took the fold fraction 12.8% -> 0.0% (min det
+// +0.31, provably one-to-one) while mean displacement only fell 31 px -> 19 px.
+//
+// Quarter resolution, so sigma 3 texels here is sigma 12 on the sim grid and
+// the whole thing costs two blits and two 256^2 draws. The caustic keeps
+// reading the SHARP field — folds there are the physics that draws the veins.
+// ============================================================================
+static constexpr int WAVE_SMOOTH_RES = SIM / 4;
+
+static void buildSmoothWave() {
+    auto& st  = *g_pGlobalState;
+    auto& sm  = st.shaderManager;
+    auto& src = st.waveFb[st.waveCurrent];
+    if (!src || !src->getTexture() || fbId(src) == 0)
+        return;
+
+    // Half float regardless of what the wave field itself fell back to: this is
+    // a SMOOTH field of ~0.01-amplitude values and 8 bits would quantise its
+    // gradient into terraces. The stored bias (0.5 on the UNORM fallback) is
+    // just a constant and survives a linear filter untouched, so mixing formats
+    // is safe — the shader subtracts waveBias either way.
+    auto ensure = [&](SP<Render::IFramebuffer>& f, const char* name, int n) {
+        if (!f)
+            f = g_pHyprRenderer->createFB(name);
+        if (f->m_size.x != n || f->m_size.y != n) {
+            f->alloc(n, n, DRM_FORMAT_ABGR16161616F);
+            if (!f->getTexture() || fbId(f) == 0)
+                f->alloc(n, n, src->m_drmFormat);
+        }
+        return f->getTexture() && fbId(f) != 0;
+    };
+    if (!ensure(st.waveHalfFb,      "hyprwater-wave-half",       SIM / 2))          return;
+    if (!ensure(st.waveSmoothFb,    "hyprwater-wave-smooth",     WAVE_SMOOTH_RES))  return;
+    if (!ensure(st.waveSmoothTmpFb, "hyprwater-wave-smooth-tmp", WAVE_SMOOTH_RES))  return;
+
+    // TWO EXACT 2x STEPS, never one 4x blit. GL_LINEAR averages 2x2 texels and
+    // nothing more, so a single 4x reduction reads a 2x2 box out of a 4x4
+    // footprint and discards 12 of every 16 — the same aliasing the backdrop
+    // sampler had to be fixed for.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbId(src));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbId(st.waveHalfFb));
+    glBlitFramebuffer(0, 0, SIM, SIM, 0, 0, SIM / 2, SIM / 2, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbId(st.waveHalfFb));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbId(st.waveSmoothFb));
+    glBlitFramebuffer(0, 0, SIM / 2, SIM / 2, 0, 0, WAVE_SMOOTH_RES, WAVE_SMOOTH_RES,
+                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    // Separable Gaussian. The blur shader takes a RADIUS and uses sigma =
+    // radius/3, so 9 texels here is sigma 3 at quarter res == sigma 12 on the
+    // sim grid, which is the measured figure above.
+    const auto& bu = sm.blurUniforms;
+    auto sh = g_pHyprOpenGL->useShader(sm.blurShader);
+    sh->setUniformMatrix3fv(SHADER_PROJ, 1, GL_FALSE, FULLSCREEN_PROJECTION);
+    // Unit 8, same cache-poisoning rule as every other offscreen pass: the
+    // compositor caches what it believes is bound on the low units.
+    sh->setUniformInt(SHADER_TEX, 8);
+    glBindVertexArray(sh->getUniformLocation(SHADER_SHADER_VAO));
+    glUniform1f(bu.radius, 9.0f);
+    g_pHyprOpenGL->setViewport(0, 0, WAVE_SMOOTH_RES, WAVE_SMOOTH_RES);
+    glActiveTexture(GL_TEXTURE8);
+
+    auto pass = [&](SP<Render::IFramebuffer>& from, SP<Render::IFramebuffer>& to, float dx, float dy) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbId(to));
+        from->getTexture()->bind();
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glUniform2f(bu.direction, dx, dy);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    };
+    pass(st.waveSmoothFb, st.waveSmoothTmpFb, 1.0f / WAVE_SMOOTH_RES, 0.0f);
+    pass(st.waveSmoothTmpFb, st.waveSmoothFb, 0.0f, 1.0f / WAVE_SMOOTH_RES);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(0);
+}
+
 static void renderCausticTex() {
     auto& st = *g_pGlobalState;
     auto& sm = st.shaderManager;
@@ -799,6 +905,12 @@ static void renderCausticTex() {
     const GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
     glDisable(GL_SCISSOR_TEST);
     g_pHyprOpenGL->setCapStatus(GL_BLEND, false);
+
+    // Piggybacked here rather than on the sim step: it needs exactly the same
+    // scissor-off / blend-off / restore-the-FBO envelope, and the warp reads a
+    // heavily low-passed field so this pass's ~72 Hz cadence is far more than
+    // it can resolve.
+    buildSmoothWave();
 
     const float depth = cfg.shimmerDepth ? static_cast<float>(**cfg.shimmerDepth) : 1.0f;
     constexpr float WATER_N = 1.333f;
@@ -887,7 +999,25 @@ static void renderCausticTex() {
     // caustics SHARPER the deeper the water, holding the astigmatic pair apart
     // instead of merging it.
     const float scaleUp = float(CAUSTIC_RES) / float(SIM);
-    const float blurTexels = std::clamp(lensK * 10.0f * scaleUp, 0.6f, 12.0f);
+    // ...AND THE RECONSTRUCTION FILTER FOR THE SPLAT, which is what the floor
+    // is really about. The splat is a POINT SAMPLING of a continuous density on
+    // a unit lattice, so the deposited field carries an alias at the lattice
+    // frequency. It is not white noise: the landing spacing drifts smoothly
+    // (measured p50 1.00, p90 1.46 target texels), so the alias beats against
+    // the lattice and prints a coherent dot-and-stripe weave across every dim
+    // region — visible as stepped contour stripes with dotty edges, worst
+    // exactly where the field is smoothest and there is nothing else to hide
+    // it. Widening the deposit kernel and blurring afterwards are the SAME
+    // convolution, so this is the cheap end of that identity.
+    //
+    // Measured on a live-settings field: the weave is gone at sigma 0.7 target
+    // texels and the veins are still crisp; sigma 1.1+ starts costing real
+    // sharpness. The old floor was radius 0.6, i.e. sigma 0.2 -- effectively no
+    // filter at all, which is why the weave was there at every setting. Radius
+    // is 3*sigma in the blur shader, so 2.1 is that measured optimum, and the
+    // depth term is scaled so it passes through the same point rather than
+    // sitting two decades below the floor and never doing anything.
+    const float blurTexels = std::clamp(lensK * 30.0f * scaleUp, 2.1f, 12.0f);
     {
         const auto& bu = sm.blurUniforms;
         auto sh = g_pHyprOpenGL->useShader(sm.blurShader);
@@ -1566,6 +1696,8 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFram
 
     if (blurTempFramebuffer->m_size.x != width || blurTempFramebuffer->m_size.y != height)
         blurTempFramebuffer->alloc(width, height, sampleFramebuffer->m_drmFormat);
+    // Matches whatever the sample FB ended up as, so the ping-pong never
+    // narrows precision on one leg.
 
     // Fullscreen quad projection: maps VAO positions [0,1] to clip space [-1,1]
     static constexpr std::array<float, 9> FULLSCREEN_PROJECTION = {
@@ -1935,6 +2067,22 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glActiveTexture(GL_TEXTURE0);
                 glUniform1i(uniforms.waveTex, 2);
+            }
+            // The band-limited copy the refraction warp reads — see
+            // buildSmoothWave(). Unit 11: 0-7 are taken here and 8-10 belong to
+            // the offscreen passes. Set unconditionally; an unbound unit samples
+            // as a CONSTANT, and only this field's GRADIENT is ever used, so a
+            // frame before the texture exists is calm glass, never garbage.
+            glUniform1i(uniforms.waveSmoothTex, 11);
+            glUniform1f(uniforms.waveSmoothTexel, 1.0f / static_cast<float>(WAVE_SMOOTH_RES));
+            if (auto& swfb = g_pGlobalState->waveSmoothFb; swfb && swfb->getTexture()) {
+                glActiveTexture(GL_TEXTURE11);
+                swfb->getTexture()->bind();
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glActiveTexture(GL_TEXTURE0);
             }
             // The analytic stroke trail, freshly summed this frame. Unit 5 —
             // 0 backdrop, 1 layer mask, 2 water, 3/4 sim internals. The

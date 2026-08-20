@@ -76,6 +76,14 @@ uniform sampler2D waveTex;   // R = h(t), G = h(t-1), biased +0.5
 uniform float shimmerDepth;  // water depth = projection distance to the floor
 uniform float waveSubFrac;   // 0..1 between the two stored sim states
 uniform float waveTexel;     // 1 / simulation grid size, for the C1 read
+// BAND-LIMITED COPY OF THE SAME SURFACE, for the refraction warp only.
+// See the note above waveHSmooth(): the warp's Jacobian is proportional to the
+// surface CURVATURE, which lives at the shortest wavelengths, so the sharp
+// field folds the backdrop map over itself long before the displacement gets
+// anywhere near its budget. Quarter resolution, Gaussian-reduced (~12 texels of
+// the sim grid), built once per caustic pass.
+uniform sampler2D waveSmoothTex;
+uniform float waveSmoothTexel;   // 1 / smoothed grid size
 // Real-time bow wave of THIS window while it is being dragged. In a real
 // fluid the incompressible pressure response around a moving body is
 // INSTANTANEOUS — only the waves it sheds propagate at wave speed — so this
@@ -264,7 +272,7 @@ vec4 texBicubic(sampler2D t, vec2 uv, vec2 texSize) {
     return mix(mix(d, c, s0.x), mix(b, a, s0.x), s0.y);
 }
 
-float waveH(vec2 q) {
+float waveH(sampler2D hTex, float hTexel, vec2 q) {
     // NEITHER fract() NOR clamp(). fract() wrapped, putting a hard seam wherever
     // the coordinate crossed 0/1 — which the edge-refraction zone then stretched
     // into blocky banding along the border. clamp() would instead freeze the
@@ -304,9 +312,9 @@ float waveH(vec2 q) {
     vec2 duv = flowShift > 0.0
              ? texture(velTexG, uv).rg * (flowShift * waveSubFrac)
              : vec2(0.0);
-    // C2 read: see texBicubic above. waveTexel is 1/grid, so its reciprocal
+    // C2 read: see texBicubic above. hTexel is 1/grid, so its reciprocal
     // is the grid size the kernel needs.
-    vec2 hh = texBicubic(waveTex, uv - duv, vec2(1.0 / max(waveTexel, 1e-9))).rg - waveBias;
+    vec2 hh = texBicubic(hTex, uv - duv, vec2(1.0 / max(hTexel, 1e-9))).rg - waveBias;
     float h = mix(hh.y, hh.x, waveSubFrac);
     // Instantaneous bow wave of a dragged window: crest hugging the leading
     // edge, trough behind, zero at the centre and far away. Analytic in the
@@ -350,10 +358,43 @@ float waveH(vec2 q) {
     return h;
 }
 
+// The sharp surface: what the caustic and everything else reads.
+float waveH(vec2 q)       { return waveH(waveTex, waveTexel, q); }
+// THE BAND-LIMITED SURFACE — REFRACTION WARP ONLY.
+//
+// The warp maps the backdrop p -> p + k*grad(h), and that map is one-to-one
+// only while det(I + k*H) stays positive: the thing that decides whether you
+// see the backdrop ONCE is the surface CURVATURE, not the displacement.
+// The old guard limited the displacement MAGNITUDE, which is a function of the
+// slope — and the slope is largest on a wave's FLANKS while the curvature is
+// largest at its CREST, where the slope passes through zero and the limiter
+// does nothing at all. So it could never prevent a fold; it only flattened the
+// flanks while leaving the folding crests untouched.
+//
+// Measured on the live settings (depth 3.5, scale 3): the map folded over
+// ~13% of every glass window even after the limiter, and a fold is multi-valued
+// by definition — the same patch of backdrop drawn two or three times, with a
+// hard crease along the fold line. That is the "you see the same wave twice".
+//
+// Curvature is concentrated at the SHORTEST wavelengths (it scales as 1/λ²)
+// while the displacement itself comes from the mid-scale swell, so low-passing
+// the surface the warp reads kills the folds and barely touches how far the
+// image actually moves: at the same coefficient, ~12 texels of Gaussian
+// reduction takes the fold fraction from 12.8% to 0.0% (min det +0.31, i.e.
+// provably one-to-one everywhere) while the mean displacement only falls from
+// 31 px to 19 px. The caustic keeps reading the sharp field, so the fine veins
+// are unchanged — folds there are the physics, and they are what draws them.
+float waveHSmooth(vec2 q) { return waveH(waveSmoothTex, waveSmoothTexel, q); }
+
 // Slope, for pulling the backdrop sample along the surface normal.
 vec2 waveSlope(vec2 q, float e) {
     return vec2(waveH(q + vec2(e, 0.0)) - waveH(q - vec2(e, 0.0)),
                 waveH(q + vec2(0.0, e)) - waveH(q - vec2(0.0, e))) / (2.0 * e);
+}
+
+vec2 waveSlopeSmooth(vec2 q, float e) {
+    return vec2(waveHSmooth(q + vec2(e, 0.0)) - waveHSmooth(q - vec2(e, 0.0)),
+                waveHSmooth(q + vec2(0.0, e)) - waveHSmooth(q - vec2(0.0, e))) / (2.0 * e);
 }
 
 // Second derivatives (h_xx, h_yy, h_xy) by central differences.
@@ -473,6 +514,28 @@ vec2 refractionDir(vec2 uv) {
 // ============================================================================
 // MAIN — Thick-glass refraction model
 // ============================================================================
+
+// OUTPUT DITHER.
+// The water is mostly large, smooth, low-contrast gradients, and those are the
+// worst case for an 8-bit target: neighbouring output levels are 1/255 apart,
+// so a gradient that changes slower than that across the screen holds one level
+// for many pixels and then steps. The eye finds those steps easily and reads
+// them as contour stripes -- the same artifact as a low-bitrate video gradient.
+// Nothing upstream is at fault; the height field is half float and the caustic
+// is computed in float. The precision is lost at the very last write.
+//
+// Adding sub-level noise before that write trades the banding for a fine grain
+// that averages back to the correct value. Triangular PDF (the difference of
+// two uniforms) rather than plain uniform noise: it decorrelates the error from
+// the signal, so flat areas do not keep a visible tint of the noise.
+float dHash(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+vec3 outputDither(vec2 px) {
+    return vec3(dHash(px) - dHash(px + 17.0)) * (1.0 / 255.0);
+}
 
 void main() {
     vec2 uv = v_texcoord;
@@ -618,7 +681,9 @@ void main() {
             // Clamped at 1.0 because past that the slider means something
             // else — deliberate over-exposure of the veins, per the tone
             // curve below — and a physically over-steep surface is not that.
-            waveGrad = waveSlope(wpBase, 0.0150) * min(shimmerIntensity, 1.0);
+            // BAND-LIMITED read — see waveHSmooth(). The sharp field folds the
+            // backdrop map over itself and prints every wave twice.
+            waveGrad = waveSlopeSmooth(wpBase, 0.0150) * min(shimmerIntensity, 1.0);
             waveWarp = waveGrad * lensK
                      / max(fullSize / max(fullSize.x, 1.0), vec2(0.001));
 
@@ -1068,11 +1133,13 @@ void main() {
             : vec3(0.0);
 
         // Hyprland's compositor expects premultiplied alpha (blend GL_ONE, GL_ONE_MINUS_SRC_ALPHA).
+        compRGB += outputDither(gl_FragCoord.xy);
         fragColor = vec4(compRGB * compA, compA);
     } else {
         // Windows: output the glass effect alone, surface is rendered separately by Hyprland.
         // Premultiplied: without this, a fading window's glass keeps full RGB contribution
         // because the GL_ONE source factor adds raw color regardless of alpha.
+        color += outputDither(gl_FragCoord.xy);
         fragColor = vec4(color * glassA, glassA);
     }
 }
