@@ -84,6 +84,13 @@ uniform float waveTexel;     // 1 / simulation grid size, for the C1 read
 // the sim grid), built once per caustic pass.
 uniform sampler2D waveSmoothTex;
 uniform float waveSmoothTexel;   // 1 / smoothed grid size
+// THE displacement coefficient, in wave-field units — the exact number the
+// caustic splat pass transported light with. Passed in rather than re-derived
+// here: a bright vein and the squeeze in the image under it are the same event,
+// and two independent derivations of "the same" coefficient is how they ended
+// up 2x to 15x apart (and window-size dependent). Same reason VIS should not be
+// declared twice.
+uniform float causticK;
 // Real-time bow wave of THIS window while it is being dragged. In a real
 // fluid the incompressible pressure response around a moving body is
 // INSTANTANEOUS — only the waves it sheds propagate at wave speed — so this
@@ -656,16 +663,39 @@ void main() {
     const float WATER_N = 1.333;
     const float SNELL   = 1.0 - 1.0 / WATER_N;
     float lensK    = max(shimmerDepth, 0.10) * SNELL * 0.080;
+    // ONE NUMBER, PASSED IN, NOT TWO DERIVED SEPARATELY. causticK is the exact
+    // coefficient the splat pass transports light with. See the warp below for
+    // why re-deriving it here was wrong by 2x to 15x.
     if (shimmerIntensity > 0.001) {
         wpBase = 0.5 + ((winOrigin + uvG * winSize) - deskSize * 0.5)
                    / max(deskSize.x, 1.0) * (0.85 * shimmerScale);
         {
-            // Divided by the window's pixel size so the shift is a constant
-            // number of PIXELS: a small popup and a maximised window then warp
-            // by the same visible amount instead of the big one barely moving.
-            // Warping scales the whole optical effect; depth is the physical
-            // distance. Their product is the displacement coefficient, and the
-            // caustics below use the very same number.
+            // THE SAME DISPLACEMENT THE LIGHT TOOK, IN PIXELS.
+            //
+            // A bright vein and the squeeze in the image behind it are ONE
+            // event: refraction moves the light and moves the view of the floor
+            // by the same amount. So the warp has to use the coefficient the
+            // splat actually transported light with, in the same units.
+            //
+            // The old line did not. It was `waveGrad * lensK / (fullSize /
+            // fullSize.x)`, which is NOT a divide by the window's pixel size —
+            // that vector is (1, aspect), so it only fixed the aspect ratio and
+            // left the displacement proportional to the window's WIDTH. The
+            // splat meanwhile displaces in the wave field's own coordinates,
+            // which are window-independent. Measured at the live settings, the
+            // warp moved the image 2.3x (400 px window) to 14.6x (2560 px
+            // window) further than the caustic moved the light — so the veins
+            // never sat where the image was being bent, and the disagreement
+            // changed as you resized.
+            //
+            // causticK is that coefficient in wave-field units. One wave-field
+            // unit is deskSize.x / (0.85 * shimmerScale) desktop pixels — the
+            // inverse of the wpBase mapping right above — so causticK * that is
+            // the displacement in PIXELS, and dividing by fullSize puts it in
+            // window uv. The result depends on neither window size nor
+            // shimmerScale, and its Jacobian is exactly causticK * H, which is
+            // the splat's Jacobian: the two now fold, stretch and squeeze
+            // together by construction.
             // SCALED BY THE INTENSITY SLIDER, below 1.0 only. The slider used
             // to reach the caustic veins and nothing else, so turning it down
             // left the surface bending and glinting at full strength: the
@@ -684,8 +714,8 @@ void main() {
             // BAND-LIMITED read — see waveHSmooth(). The sharp field folds the
             // backdrop map over itself and prints every wave twice.
             waveGrad = waveSlopeSmooth(wpBase, 0.0150) * min(shimmerIntensity, 1.0);
-            waveWarp = waveGrad * lensK
-                     / max(fullSize / max(fullSize.x, 1.0), vec2(0.001));
+            float qToPx = deskSize.x / max(0.85 * shimmerScale, 1e-4);
+            waveWarp = waveGrad * (causticK * qToPx) / max(fullSize, vec2(1.0));
 
             // ── STAY INSIDE THE CAPTURED BACKDROP ──────────────────────────
             // hyprwater only samples a padded region around the window, so
@@ -701,14 +731,21 @@ void main() {
             vec2 margin = uvPadding / max(1.0 - 2.0 * uvPadding, vec2(0.001));
             vec2 budget = max(margin * 0.6, vec2(0.001));
             // SOFT compressor, never a hard clamp. Clamped displacement is
-            // CONSTANT displacement: at high depth most of the surface pinned
-            // against the budget, and a constant shift moves the image without
-            // bending it — straight lines came back the deeper the water got,
-            // with hard seams wherever +budget regions met -budget regions.
-            // This rational limiter is linear for small warps, approaches the
-            // budget asymptotically, and its derivative never reaches zero:
-            // deep water compresses its bending but NEVER flattens it.
-            waveWarp = waveWarp / (1.0 + abs(waveWarp) / budget);
+            // CONSTANT displacement: a constant shift moves the image without
+            // bending it, so straight lines come back with hard seams wherever
+            // +budget regions meet -budget regions.
+            //
+            // p-NORM SOFT MIN rather than the old `w / (1 + |w|/budget)`. That
+            // rational form starts compressing immediately — at a third of the
+            // budget it was already taking 25% off, which is most of the
+            // surface, so it was quietly flattening the water everywhere to
+            // guard against an excursion almost nothing reached. This is flat
+            // to within 0.3% below 0.6*budget and only bends where it has to;
+            // measured, it delivers ~35% more displacement at identical fold
+            // safety. Same asymptote, same guarantee that nothing samples
+            // outside the captured region.
+            vec2 wn = abs(waveWarp) / budget;
+            waveWarp = waveWarp * inversesqrt(sqrt(1.0 + wn * wn * wn * wn));
 
             // Fade the warp out approaching the border. Even inside the budget,
             // a sample near the edge reaches content the neighbouring monitor

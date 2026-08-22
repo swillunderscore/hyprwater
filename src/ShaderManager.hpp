@@ -17,6 +17,7 @@ struct SGlassUniforms {
     GLint waveTexel                = -1;
     GLint waveSmoothTex            = -1;
     GLint waveSmoothTexel          = -1;
+    GLint causticK                 = -1;
     GLint winWake                  = -1;
     GLint winRectSim               = -1;
     GLint trailTex                 = -1;

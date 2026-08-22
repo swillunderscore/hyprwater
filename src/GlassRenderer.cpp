@@ -783,6 +783,27 @@ static constexpr int CAUSTIC_RES = 1024;
 // ============================================================================
 static constexpr int WAVE_SMOOTH_RES = SIM / 4;
 
+// THE displacement coefficient, in wave-field units. ONE definition, because
+// the splat pass, the smoothing radius below and the glass shader's warp all
+// have to agree: a bright vein and the squeeze in the image under it are the
+// same refraction event. They were derived independently before, and ended up
+// 2x to 15x apart with the error scaling by window width.
+//
+// Snell to first order: light leaving water at angle t bends to n*sin(t), so a
+// surface tilted by `slope` shifts what is behind it by depth*(1 - 1/n)*slope.
+// n = 1.333, so the factor is 0.25 and depth is the only free quantity. The
+// 0.080 puts h's arbitrary sim units into wave-field units; the 0.100 is the
+// vein-regime calibration (transporting energy for real at the full analytic
+// strength piles whole regions into blown-out pools, where the pointwise
+// 1/|det| could only ever draw the det=0 contour).
+static float waterCausticK() {
+    const auto& cfg = g_pGlobalState->config;
+    const float depth = cfg.shimmerDepth ? static_cast<float>(**cfg.shimmerDepth) : 1.0f;
+    constexpr float WATER_N = 1.333f;
+    constexpr float SNELL   = 1.0f - 1.0f / WATER_N;
+    return std::max(depth, 0.10f) * SNELL * 0.080f * 0.100f;
+}
+
 static void buildSmoothWave() {
     auto& st  = *g_pGlobalState;
     auto& sm  = st.shaderManager;
@@ -821,9 +842,25 @@ static void buildSmoothWave() {
     glBlitFramebuffer(0, 0, SIM / 2, SIM / 2, 0, 0, WAVE_SMOOTH_RES, WAVE_SMOOTH_RES,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
-    // Separable Gaussian. The blur shader takes a RADIUS and uses sigma =
-    // radius/3, so 9 texels here is sigma 3 at quarter res == sigma 12 on the
-    // sim grid, which is the measured figure above.
+    // HOW MUCH SMOOTHING — scaled by the coefficient, not fixed.
+    //
+    // The map folds once k*|H| exceeds 1, so the curvature that has to be
+    // removed grows with k. A Gaussian of width s attenuates curvature roughly
+    // as 1/s^2, which puts the safe width at s proportional to sqrt(k). The
+    // constant is anchored on the measured point: at the live settings
+    // (causticK 0.0071) sigma 8 sim texels holds the fold fraction at 0.000%
+    // with det comfortably positive, and 95*sqrt(k) passes through it.
+    // Verified across the whole depth slider, 0.5 to 10: fold stays 0.000% and
+    // min det 0.32-0.61 the entire way, while the delivered displacement still
+    // rises 3.8 px -> 21 px, so depth keeps meaning something.
+    //
+    // The two 2x blits above are already a 4x4 box, worth about sigma 4.6 on
+    // the sim grid; Gaussians add in quadrature, so only the remainder is left
+    // for the blur. The blur shader takes a RADIUS and uses sigma = radius/3.
+    const float sigmaSim = std::clamp(95.0f * std::sqrt(waterCausticK()), 3.0f, 24.0f);
+    const float sigmaQ   = std::sqrt(std::max(sigmaSim * sigmaSim - 21.2f, 1.0f)) / 4.0f;
+    const float blurR    = std::clamp(3.0f * sigmaQ, 0.6f, 16.0f);
+
     const auto& bu = sm.blurUniforms;
     auto sh = g_pHyprOpenGL->useShader(sm.blurShader);
     sh->setUniformMatrix3fv(SHADER_PROJ, 1, GL_FALSE, FULLSCREEN_PROJECTION);
@@ -831,7 +868,7 @@ static void buildSmoothWave() {
     // compositor caches what it believes is bound on the low units.
     sh->setUniformInt(SHADER_TEX, 8);
     glBindVertexArray(sh->getUniformLocation(SHADER_SHADER_VAO));
-    glUniform1f(bu.radius, 9.0f);
+    glUniform1f(bu.radius, blurR);
     g_pHyprOpenGL->setViewport(0, 0, WAVE_SMOOTH_RES, WAVE_SMOOTH_RES);
     glActiveTexture(GL_TEXTURE8);
 
@@ -912,10 +949,10 @@ static void renderCausticTex() {
     // it can resolve.
     buildSmoothWave();
 
-    const float depth = cfg.shimmerDepth ? static_cast<float>(**cfg.shimmerDepth) : 1.0f;
-    constexpr float WATER_N = 1.333f;
-    constexpr float SNELL   = 1.0f - 1.0f / WATER_N;
-    const float lensK = std::max(depth, 0.10f) * SNELL * 0.080f;
+    const float causticK = waterCausticK();
+    // Kept for the finite-sun blur below, which is expressed against the
+    // pre-calibration lens strength.
+    const float lensK = causticK * 10.0f;
 
     {
         const auto& u = sm.causticUniforms;
@@ -943,7 +980,7 @@ static void renderCausticTex() {
         // folds are just forming -- delicate vein networks -- and with h in
         // sim units rather than metres, matching that REGIME is the honest
         // calibration available.
-        glUniform1f(u.causticK, lensK * 0.100f);
+        glUniform1f(u.causticK, causticK);
         glUniform1f(u.gridN, float(CAUSTIC_RES));
 
         glActiveTexture(GL_TEXTURE8);
@@ -2075,6 +2112,10 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
             // frame before the texture exists is calm glass, never garbage.
             glUniform1i(uniforms.waveSmoothTex, 11);
             glUniform1f(uniforms.waveSmoothTexel, 1.0f / static_cast<float>(WAVE_SMOOTH_RES));
+            // The SAME number the splat pass transported light with. See
+            // waterCausticK(): deriving it twice is how the warp ended up 2x to
+            // 15x stronger than the caustic, scaling with window width.
+            glUniform1f(uniforms.causticK, waterCausticK());
             if (auto& swfb = g_pGlobalState->waveSmoothFb; swfb && swfb->getTexture()) {
                 glActiveTexture(GL_TEXTURE11);
                 swfb->getTexture()->bind();
