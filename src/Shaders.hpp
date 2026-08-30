@@ -552,8 +552,9 @@ void main() {
     // For windows, hasMask is false and this block is skipped entirely.
     vec4 surfacePixel = vec4(0.0);
     bool hasMask = (useMask == 1);
+    vec2 maskUV = vec2(0.0);
     if (hasMask) {
-        vec2 maskUV = uv * maskUVScale + maskUVOffset;
+        maskUV = uv * maskUVScale + maskUVOffset;
         surfacePixel = texture(maskTex, clamp(maskUV, 0.001, 0.999));
         if (surfacePixel.a < maskAlphaThreshold) discard;
     }
@@ -1160,18 +1161,66 @@ void main() {
     if (hasMask) {
         // Layers only: composite the rendered surface over the glass effect
         // in a single pass. surfacePixel is premultiplied alpha from Hyprland's
-        // surface rendering, so we unpremultiply before the 'over' blend.
+        // surface rendering.
+        //
+        // The mask alpha CONFLATES two different things: how translucent the
+        // material is, and how much of the pixel the material covers. In the
+        // interior they are the same number — coverage is 1 — but along an
+        // antialiased edge coverage is fractional, and treating it as material
+        // alpha pours glass into the UNCOVERED slice of the pixel too. That
+        // slice belongs to whatever is behind the layer, which Hyprland
+        // composites in raw; glass is a blurred, caustic-lit version of the
+        // same backdrop, so the two disagree exactly when the water is doing
+        // something bright. The only fractional-coverage pixels are the
+        // antialiased arcs of rounded corners (straight edges land on the
+        // pixel grid), which is why this read as a colored dot on the corner
+        // of every pill.
+        //
+        // Split the two with a TWO-MATERIAL model: an edge pixel is a mix of
+        // the highest- and lowest-alpha materials in its 3x3 neighborhood, in
+        // a ratio f recovered from its own alpha. Each side then gets what
+        // belongs behind IT: glass under a content side, nothing under an
+        // empty side (Hyprland composites the raw backdrop there via 1-compA).
+        // "Content" is alpha >= the discard threshold — the same definition
+        // the discard uses, so the two never disagree.
+        //
+        // The max alone is NOT the material alpha: next to an opaque icon on
+        // a 0.65 pill, it reads 1.0 and misfiles plain pill pixels as
+        // partially-covering opaque material, stripping their glass — which
+        // drew a dark de-glassed halo around every icon and workspace dot.
+        // Content-vs-content boundaries must keep glass under BOTH sides,
+        // and with loIsContent = 1 the math collapses to glassA*(1-surfA),
+        // the original interior formula, so those seams render as before.
+        //
+        // Interior pixels are flat (hi == lo), f degenerates to 1, old math
+        // exactly; a faded low-alpha pill keeps full glass — its alpha is
+        // flat, not an edge — which is the case the 0.002 threshold exists
+        // for. On a content-vs-empty arc the contribution goes to 0 with f,
+        // so the hard step at the discard threshold disappears along with
+        // the corner dots.
         float surfA = surfacePixel.a;
-        vec3 surfRGB = surfA > 0.001 ? surfacePixel.rgb / surfA : vec3(0.0);
+        vec2 maskTexel = maskUVScale / fullSize;
+        float aHi = surfA;
+        float aLo = surfA;
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+                if (dx == 0 && dy == 0) continue;
+                vec2 nUV = clamp(maskUV + vec2(float(dx), float(dy)) * maskTexel, 0.001, 0.999);
+                float na = texture(maskTex, nUV).a;
+                aHi = max(aHi, na);
+                aLo = min(aLo, na);
+            }
+        float f = (aHi - aLo) > 1e-4 ? clamp((surfA - aLo) / (aHi - aLo), 0.0, 1.0) : 1.0;
+        float loIsContent = aLo >= maskAlphaThreshold ? 1.0 : 0.0;
+        float glassCov = f * (1.0 - aHi) + (1.0 - f) * (1.0 - aLo) * loIsContent;
+        float compA = surfA + glassA * glassCov;
 
-        float compA = surfA + glassA * (1.0 - surfA);
-        vec3 compRGB = compA > 0.001
-            ? (surfRGB * surfA + color * glassA * (1.0 - surfA)) / compA
-            : vec3(0.0);
-
+        // Premultiplied throughout: surfacePixel.rgb already carries the
+        // content term, so the glass under it is the only part to add.
         // Hyprland's compositor expects premultiplied alpha (blend GL_ONE, GL_ONE_MINUS_SRC_ALPHA).
-        compRGB += outputDither(gl_FragCoord.xy);
-        fragColor = vec4(compRGB * compA, compA);
+        vec3 compRGB = surfacePixel.rgb + color * (glassA * glassCov);
+        compRGB += outputDither(gl_FragCoord.xy) * compA;
+        fragColor = vec4(compRGB, compA);
     } else {
         // Windows: output the glass effect alone, surface is rendered separately by Hyprland.
         // Premultiplied: without this, a fading window's glass keeps full RGB contribution
