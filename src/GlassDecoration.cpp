@@ -194,17 +194,18 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
 
     // One time-smoothed average for the whole window, so the dim is uniform and
     // does not pump with an animated wallpaper.
+    // adaptive_tint_terminals_only: a non-terminal window gets no tint at all
+    // (see applyGlassEffect), so it doesn't need the luma pass either.
     const auto& lumaCfg = g_pGlobalState->config;
-    const bool adaptiveAllowed =
+    const bool tintAllowed =
         !(lumaCfg.adaptiveTintTerminalsOnly && **lumaCfg.adaptiveTintTerminalsOnly) ||
         isTerminalClass(window->m_class);
-    SP<Render::IFramebuffer> adaptiveLumaFb = m_lumaFb[m_lumaCurrent];
-    if (adaptiveAllowed) {
-        GlassRenderer::updateAdaptiveLuma(m_sampleFramebuffer, m_lumaFb, m_lumaCurrent, m_lumaSeeded,
+    SP<Render::IFramebuffer> adaptiveLumaFb;
+    if (tintAllowed) {
+        GlassRenderer::updateAdaptiveLuma(m_sampleFramebuffer, m_luma,
                                           dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(),
                                           viewportWidth, viewportHeight);
-    } else {
-        adaptiveLumaFb = nullptr;
+        adaptiveLumaFb = m_luma.fb[m_luma.current];
     }
 
     GlassRenderer::DBG_LOG("RP win=%lx alpha=%.3f BLURRED str=%.2f rad=%.2f it=%d sample=%.0fx%.0f srcfb=%u box=%.0f,%.0f %.0fx%.0f\n",
@@ -221,7 +222,7 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
     GlassRenderer::applyGlassEffect(m_sampleFramebuffer, source,
                                      windowBox, transformBox, alpha,
                                      cornerRadius, roundingPower, m_samplePaddingRatio, ctx,
-                                     nullptr, adaptiveLumaFb);
+                                     nullptr, adaptiveLumaFb, tintAllowed);
 }
 
 eDecorationType CGlassDecoration::getDecorationType() {

@@ -827,6 +827,7 @@ void main() {
         // 1x1 texture (adaptiveluma.frag), so it is identical for every fragment
         // and identical content always renders identically.
         float lAvg = texture(adaptiveLumaTex, vec2(0.5)).r * brightness;
+        if (isnan(lAvg) || isinf(lAvg)) lAvg = 0.0;  // adaptiveluma.frag heals it next frame
         float dim  = clamp(adaptiveTarget / max(lAvg, 1e-4), 0.0, 1.0);
         adaptiveScale = mix(1.0, dim, adaptiveTint);
     }
@@ -1807,6 +1808,15 @@ void main() {
     float lAvg = dot(textureLod(tex, vec2(0.5), 30.0).rgb, vec3(0.2126, 0.7152, 0.0722));
 
     float prev = texture(prevTex, vec2(0.5)).r;
+
+    // A NaN is permanent in an EMA: mix(NaN, x, a) is NaN, every frame after,
+    // and the glass shader's max(NaN, 1e-4) reads it as "no dim" — the window
+    // silently stops tinting until it is closed. Drop a bad reading, and let a
+    // bad stored value be replaced by the next good one.
+    bool lOk = !isnan(lAvg) && !isinf(lAvg) && lAvg >= 0.0 && lAvg < 60000.0;
+    bool pOk = !isnan(prev) && !isinf(prev) && prev >= 0.0 && prev < 60000.0;
+    if (!lOk) lAvg = pOk ? prev : 0.0;
+    if (!pOk) prev = lAvg;
 
     // Deadband. Once converged, mix(prev, lAvg, tiny alpha) lands between two
     // representable values and rounds inconsistently frame to frame — a limit

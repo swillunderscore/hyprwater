@@ -35,9 +35,7 @@ class CGlassDecoration : public IHyprWindowDecoration {
     SP<Render::IFramebuffer> m_blurTempFramebuffer;
     // 1x1 ping-pong holding this window's time-smoothed average backdrop luma.
     // A fragment shader has no memory between frames; this is that memory.
-    SP<Render::IFramebuffer> m_lumaFb[2];
-    int  m_lumaCurrent = 0;
-    bool m_lumaSeeded  = false;
+    GlassRenderer::SAdaptiveLumaState m_luma;
     Vector2D     m_samplePaddingRatio;
 
     // Track last rendered position/size to detect actual changes and seed damage

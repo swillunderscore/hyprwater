@@ -330,6 +330,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     // Every mouse press taps the water at the cursor (queueClickSplash gates
     // itself on shimmer + the mouse slider, so this is a cheap no-op when off).
+    static auto onRenderStage = Event::bus()->m_events.render.stage.listen([&](eRenderStage stage) {
+        if (stage == RENDER_BEGIN)
+            g_pGlobalState->renderFrame++;
+    });
+
     static auto onMouseButton = Event::bus()->m_events.input.mouse.button.listen(
         [&](IPointer::SButtonEvent e, Event::SCallbackInfo&) {
             if (e.state == WL_POINTER_BUTTON_STATE_PRESSED)

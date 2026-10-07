@@ -18,6 +18,10 @@ class CGlassDecoration;
 
 struct SGlobalState {
     std::vector<WP<CGlassDecoration>> decorations;
+    // Bumped at RENDER_BEGIN of every monitor frame; lets per-surface state tell
+    // a second render in the same frame from the next frame. Starts at 1 so a
+    // fresh state (frame 0) never looks like a repeat.
+    uint64_t                          renderFrame = 1;
     CShaderManager                    shaderManager;
     SPluginConfig                     config;
 

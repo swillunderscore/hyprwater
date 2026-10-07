@@ -1625,9 +1625,9 @@ void stepWaveSim() {
 
 }
 
-void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer,
-                        SP<Render::IFramebuffer> lumaFb[2], int& current, bool& seeded,
+void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer, SAdaptiveLumaState& state,
                         GLuint callerFramebufferID, int viewportWidth, int viewportHeight) {
+    auto& lumaFb = state.fb;
     auto& sm = g_pGlobalState->shaderManager;
     if (!sampleFramebuffer || !sm.isInitialized())
         return;
@@ -1641,25 +1641,29 @@ void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer,
             return;
     }
 
-    const int prev = current;
-    const int next = 1 - current;
-
-    // Frame delta -> EMA weight, so the settle time is the same whatever the
-    // compositor is running at. Clamped: a long stall must not snap the value.
-    //
-    // PER FRAMEBUFFER, not one static clock. A single shared timestamp gets
-    // consumed by whichever glass surface renders first; every other surface in
-    // the same frame then sees dt~0 and its average stops advancing. Which
-    // surface wins depends on render order, and focusing a window changes that
-    // order — so the smoothing rate silently depended on which window you last
-    // clicked.
-    static std::unordered_map<const void*, std::chrono::steady_clock::time_point> lastSeen;
-    const auto  key = static_cast<const void*>(lumaFb[0].get());
-    const auto  now = std::chrono::steady_clock::now();
-    float dt = 1.0f / 60.0f;
-    if (auto it = lastSeen.find(key); it != lastSeen.end())
-        dt = std::clamp(std::chrono::duration<float>(now - it->second).count(), 0.0f, 0.25f);
-    lastSeen[key] = now;
+    // Second render of this surface in the same frame (see SAdaptiveLumaState):
+    // overwrite the step already taken, from the same input, with the same dt.
+    const bool repeat = state.seeded && state.frame == g_pGlobalState->renderFrame;
+    if (!repeat) {
+        // Frame delta -> EMA weight, so the settle time is the same whatever the
+        // compositor is running at. Clamped: a long stall must not snap the value.
+        //
+        // PER SURFACE, not one static clock. A single shared timestamp gets
+        // consumed by whichever glass surface renders first; every other surface
+        // in the same frame then sees dt~0 and its average stops advancing.
+        const auto now = std::chrono::steady_clock::now();
+        state.dt = state.hasStepTime
+            ? std::clamp(std::chrono::duration<float>(now - state.stepTime).count(), 0.0f, 0.25f)
+            : 1.0f / 60.0f;
+        state.stepTime     = now;
+        state.hasStepTime  = true;
+        state.seededBefore = state.seeded;
+        state.frame        = g_pGlobalState->renderFrame;
+        state.current      = 1 - state.current;
+    }
+    const int next = state.current;
+    const int prev = 1 - state.current;
+    const float dt = state.dt;
 
     const auto& cfg = g_pGlobalState->config;
     const float tau = cfg.adaptiveSpeed ? std::max(0.01f, static_cast<float>(**cfg.adaptiveSpeed)) : 2.0f;
@@ -1680,7 +1684,7 @@ void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer,
     shader->setUniformInt(SHADER_TEX, 0);
     glUniform1i(sm.adaptiveLumaUniforms.prevTex, 1);
     glUniform1f(sm.adaptiveLumaUniforms.emaAlpha, alpha);
-    glUniform1f(sm.adaptiveLumaUniforms.seedPrev, seeded ? 1.0f : 0.0f);
+    glUniform1f(sm.adaptiveLumaUniforms.seedPrev, state.seededBefore ? 1.0f : 0.0f);
 
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
     glBindFramebuffer(GL_FRAMEBUFFER, fbId(lumaFb[next]));
@@ -1709,8 +1713,7 @@ void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer,
     if (hadScissor)
         glEnable(GL_SCISSOR_TEST);
 
-    current = next;
-    seeded  = true;
+    state.seeded = true;
 }
 
 void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFramebuffer>& tempFramebuffer,
@@ -1811,7 +1814,8 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
                        CBox& rawBox, CBox& transformedBox,
                        float alpha, float cornerRadius, float roundingPower,
                        const Vector2D& paddingRatio, const SResolveContext& resolveContext,
-                       const SMaskInfo* mask, SP<Render::IFramebuffer> adaptiveLumaFb) {
+                       const SMaskInfo* mask, SP<Render::IFramebuffer> adaptiveLumaFb,
+                       bool tintAllowed) {
     // ONE scissor guard for the ENTIRE effect, raw GL, not the compositor's
     // cached cap wrapper (the cache can disagree with real state and skip the
     // disable). The render pass leaves a damage-rect scissor enabled; every
@@ -2180,13 +2184,20 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
         static_cast<float>((tintColorValue >> 24) & 0xFF) / 255.0f,
         static_cast<float>((tintColorValue >> 16) & 0xFF) / 255.0f,
         static_cast<float>((tintColorValue >> 8) & 0xFF) / 255.0f);
-    glUniform1f(uniforms.tintAlpha,
-        static_cast<float>(tintColorValue & 0xFF) / 255.0f);
+    // Excluded surfaces (tintAllowed=false) get no tint of any kind: not the
+    // static tint_color, not the tone curve's bright-area dim (adaptive_dim,
+    // uploaded by uploadThemeUniforms just above), not the adaptive tint.
+    // "Terminals only" used to drop just the adaptive part, so the bar and
+    // every other window kept the rest.
+    const float tintAlphaValue = tintAllowed ? static_cast<float>(tintColorValue & 0xFF) / 255.0f : 0.0f;
+    glUniform1f(uniforms.tintAlpha, tintAlphaValue);
+    if (!tintAllowed)
+        glUniform1f(uniforms.adaptiveDim, 0.0f);
     {
         const auto& cfgAd = g_pGlobalState->config;
         // No 1x1 luma yet (first frame, or alloc failed) means no trustworthy
         // window average — leave the glass alone rather than guess at a dim.
-        const bool haveLuma = adaptiveLumaFb && adaptiveLumaFb->getTexture();
+        const bool haveLuma = tintAllowed && adaptiveLumaFb && adaptiveLumaFb->getTexture();
         glUniform1f(uniforms.adaptiveTint,
             (haveLuma && cfgAd.adaptiveTint) ? static_cast<float>(**cfgAd.adaptiveTint) : 0.0f);
         glUniform1f(uniforms.adaptiveTarget,
@@ -2209,7 +2220,7 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
         glGetUniformfv(prog, uniforms.tintAlpha, &taEff);
         const auto& vcfg = g_pGlobalState->config;
         const int   lfbWant = (vcfg.shimmerLightFromBackdrop && **vcfg.shimmerLightFromBackdrop != 0) ? 1 : 0;
-        const float taWant  = static_cast<float>(tintColorValue & 0xFF) / 255.0f;
+        const float taWant  = tintAlphaValue;
         GLfloat brEff = -7.0f, saEff = -7.0f, adEff = -7.0f, goEff = -7.0f;
         glGetUniformfv(prog, uniforms.brightness, &brEff);
         glGetUniformfv(prog, uniforms.saturation, &saEff);

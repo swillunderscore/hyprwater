@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "PluginConfig.hpp"
 
 #include <GLES3/gl32.h>
@@ -76,19 +78,42 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFram
 // Reduce the blurred sample to ONE time-smoothed average luminance in a 1x1 FB.
 // Ping-ponged because a fragment shader cannot carry state between frames, and
 // an animated wallpaper would otherwise make the dim pump with the animation.
-void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer,
-                        SP<Render::IFramebuffer> lumaFb[2], int& current, bool& seeded,
+//
+// A floating window over a fullscreen one is rendered TWICE per frame: once in
+// the floating pass, UNDER the fullscreen window, and again over it. Each render
+// used to advance the average, and the first one got the whole frame delta — so
+// the dim tracked the wallpaper hidden behind the game, not the game. A repeat
+// within the same frame now REDOES that frame's step from the same input, so the
+// last (visible) render is the one that counts.
+struct SAdaptiveLumaState {
+    SP<Render::IFramebuffer> fb[2];
+    int      current = 0;
+    bool     seeded  = false;
+    // Bookkeeping for redoing a step: which frame it was taken in, and what the
+    // step saw going in.
+    uint64_t frame        = 0;
+    bool     seededBefore = false;
+    float    dt           = 1.0f / 60.0f;
+    bool     hasStepTime  = false;
+    std::chrono::steady_clock::time_point stepTime;
+};
+
+void updateAdaptiveLuma(SP<Render::IFramebuffer>& sampleFramebuffer, SAdaptiveLumaState& state,
                         GLuint callerFramebufferID, int viewportWidth, int viewportHeight);
 
 
 // When mask is non-null (layers only), the shader composites the surface content
 // over the glass effect in a single pass. When mask is null (windows), the shader
 // outputs the glass effect alone.
+// tintAllowed=false strips every darkening tint from this pass — tint_color, the
+// tone curve's adaptive_dim and the adaptive tint — for surfaces that
+// adaptive_tint_terminals_only excludes. The rest of the glass is unchanged.
 void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFramebuffer> targetFramebuffer,
                        CBox& rawBox, CBox& transformedBox,
                        float alpha, float cornerRadius, float roundingPower,
                        const Vector2D& paddingRatio, const SResolveContext& resolveContext,
                        const SMaskInfo* mask = nullptr,
-                       SP<Render::IFramebuffer> adaptiveLumaFb = nullptr);
+                       SP<Render::IFramebuffer> adaptiveLumaFb = nullptr,
+                       bool tintAllowed = true);
 
 } // namespace GlassRenderer

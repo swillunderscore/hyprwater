@@ -176,11 +176,11 @@ void CGlassLayerSurface::sampleAndRedirect(PHLMONITOR monitor, float alpha) {
         GlassRenderer::blurBackground(m_sampleFramebuffer, m_blurTempFramebuffer, blurRadius, blurIterations, dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(), viewportWidth, viewportHeight);
 
         // Layers have no window class to test against: when the terminal-only
-        // restriction is on, overlays simply lose the adaptive tint.
+        // restriction is on, overlays (the bar included) lose every tint.
         const bool termOnly = g_pGlobalState->config.adaptiveTintTerminalsOnly &&
                               **g_pGlobalState->config.adaptiveTintTerminalsOnly;
         if (!termOnly)
-            GlassRenderer::updateAdaptiveLuma(m_sampleFramebuffer, m_lumaFb, m_lumaCurrent, m_lumaSeeded,
+            GlassRenderer::updateAdaptiveLuma(m_sampleFramebuffer, m_luma,
                                               dynamic_cast<Render::GL::CGLFramebuffer*>(source.get())->getFBID(),
                                               viewportWidth, viewportHeight);
 
@@ -283,12 +283,13 @@ void CGlassLayerSurface::compositeAndRestore(PHLMONITOR monitor, float alpha) {
 
     // The glass shader composites both the glass effect and the surface content
     // in a single pass: glass behind, surface on top, using the temp FBO alpha.
-    // A null luma framebuffer disables the adaptive tint for this pass.
+    // Terminal-only restriction on: no tint of any kind on a layer (see
+    // applyGlassEffect) — tint_color, adaptive_dim and the adaptive tint.
     const bool termOnly = g_pGlobalState->config.adaptiveTintTerminalsOnly &&
                           **g_pGlobalState->config.adaptiveTintTerminalsOnly;
-    SP<Render::IFramebuffer> lumaFb = termOnly ? nullptr : m_lumaFb[m_lumaCurrent];
+    SP<Render::IFramebuffer> lumaFb = termOnly ? nullptr : m_luma.fb[m_luma.current];
     GlassRenderer::applyGlassEffect(m_sampleFramebuffer, target,
                                      rawBox, transformBox, alpha,
                                      cornerRadius, roundingPower, m_samplePaddingRatio, ctx,
-                                     &maskInfo, lumaFb);
+                                     &maskInfo, lumaFb, !termOnly);
 }

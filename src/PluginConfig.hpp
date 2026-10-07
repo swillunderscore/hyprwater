@@ -2,6 +2,8 @@
 
 #include <hyprland/src/config/shared/Types.hpp>
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <string_view>
 #include <typeinfo>
@@ -132,13 +134,24 @@ inline constexpr auto LIGHT_ADAPTIVE_BOOST        = "plugin:hyprwater:light:adap
 } // namespace ConfigKeys
 
 // Built-in terminal WM classes for the adaptive_tint_terminals_only restriction.
+// Compared lowercased: the old exact, case-sensitive list only ever matched
+// kitty, foot and friends — Alacritty's class is "Alacritty", and Konsole,
+// WezTerm, Ghostty and GNOME's terminals report reverse-DNS app ids — so those
+// lost their tint the moment "terminals only" was switched on.
 inline bool isTerminalClass(const std::string& cls) {
     static const std::unordered_set<std::string> terminals = {
-        "kitty", "alacritty", "wezterm", "foot", "konsole",
-        "xfce4-terminal", "gnome-terminal-server", "xterm", "st",
-        "urxvt", "terminator", "warp", "qterminal", "tilix"
+        "kitty", "alacritty", "foot", "footclient",
+        "org.wezfurlong.wezterm", "wezterm",
+        "com.mitchellh.ghostty", "ghostty",
+        "org.kde.konsole", "konsole",
+        "org.gnome.terminal", "gnome-terminal-server", "org.gnome.ptyxis", "org.gnome.console",
+        "xfce4-terminal", "xterm", "st", "st-256color", "urxvt", "terminator",
+        "dev.warp.warp", "warp", "qterminal", "com.gexperts.tilix", "tilix",
+        "com.raggesilver.blackbox", "rio", "contour"
     };
-    return terminals.count(cls) != 0;
+    std::string lower = cls;
+    std::ranges::transform(lower, lower.begin(), [](unsigned char c) { return std::tolower(c); });
+    return terminals.count(lower) != 0;
 }
 
 // Cached pointers for a single config layer (built-in dark/light/global)
