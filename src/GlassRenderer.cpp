@@ -1786,6 +1786,24 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFram
     const GLboolean blurScissor = glIsEnabled(GL_SCISSOR_TEST);
     glDisable(GL_SCISSOR_TEST);
 
+    // BLENDING OFF, or the passes below only half-overwrite their targets.
+    // Hyprland draws premultiplied (ONE, ONE_MINUS_SRC_ALPHA) and the sim
+    // passes leave blending on, so a blur written with it on is
+    // blur + old * (1 - blurAlpha). Past a SCREEN EDGE the padded sample is
+    // cleared to alpha 0, so there the old texel survives whole - and the
+    // temp target is never cleared, so after every realloc (every resize)
+    // "old" is whatever recycled VRAM it was given. Read as half float, that
+    // is NaN (black, hard-edged: NaN does not average) or huge values
+    // (saturated pink/green). It lives in the off-screen rows for the life
+    // of the buffer, and each blur iteration spreads it ~5 texels further
+    // into the window: the black band along the top of windows near the top
+    // of the screen, wavy because the water warps it. Same function blurs
+    // the glass layers, so a bar on the bottom edge latched solid black the
+    // same way. Raw query and restore, like the scissor above: the cap cache
+    // can disagree with the real state and skip the disable.
+    const GLboolean blurBlend = glIsEnabled(GL_BLEND);
+    glDisable(GL_BLEND);
+
     // Ping-pong at full resolution: sampleFramebuffer ↔ blurTempFramebuffer
     for (int iteration = 0; iteration < iterations; iteration++) {
         // Horizontal pass: sampleFramebuffer → blurTempFramebuffer
@@ -1803,6 +1821,8 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFram
 
     if (blurScissor)
         glEnable(GL_SCISSOR_TEST);
+    if (blurBlend)
+        glEnable(GL_BLEND);
 
     // Restore caller's GL state without querying (avoids pipeline stalls)
     glBindFramebuffer(GL_FRAMEBUFFER, callerFramebufferID);
