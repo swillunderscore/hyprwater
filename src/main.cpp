@@ -187,10 +187,27 @@ static void hkRenderLayer(Render::IHyprRenderer* thisptr, PHLLS layerSurface, PH
         auto* rawPtr = layerSurface.get();
         auto& layerStates = g_pGlobalState->layerSurfaces;
         auto it = layerStates.find(rawPtr);
+        bool created = false;
         if (it != layerStates.end() && !it->second->getLayerSurface()) {
             it->second = std::make_shared<CGlassLayerSurface>(layerSurface);
+            created = true;
         } else if (it == layerStates.end()) {
             it = layerStates.emplace(rawPtr, std::make_shared<CGlassLayerSurface>(layerSurface)).first;
+            created = true;
+        }
+
+        // [technicolor fork] A layer's glass state can latch into rendering solid
+        // black (no backdrop, no content) for the life of the layer. Seen 2026-10-14:
+        // both bars after a mid-session Quickshell restart, and one monitor's bar at
+        // login. State created on a SETTLED layer (after a config reload) never failed.
+        // So state born while the layer was still opening is rebuilt once it settles.
+        const bool opening = layerSurface->alpha().isBeingAnimated() ||
+                             layerSurface->positionAnimation()->isBeingAnimated() ||
+                             layerSurface->sizeAnimation()->isBeingAnimated();
+        if (created && opening) {
+            it->second->m_createdWhileOpening = true;
+        } else if (it->second->m_createdWhileOpening && !opening) {
+            it->second = std::make_shared<CGlassLayerSurface>(layerSurface);
         }
 
         if (!layerSurface->m_mapped) {   // 0.56: fading-out layers render via CFadingOutState, not here
@@ -348,6 +365,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     });
 
     static auto onConfigReloaded = Event::bus()->m_events.config.reloaded.listen([&]() {
+        // [technicolor fork] Start every glass LAYER over on a config reload (rebuilt
+        // lazily on the next frame). Makes `hyprctl reload` alone fix a layer whose
+        // glass latched black - see hkRenderLayer - without restarting the client.
+        g_pGlobalState->layerSurfaces.clear();
         initConfigPointers(PHANDLE, g_pGlobalState->config);
         commitPendingPresets();
         parseLayerNamespaceFilters();

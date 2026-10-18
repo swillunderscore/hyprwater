@@ -21,6 +21,11 @@ class CGlassLayerSurface {
 
     [[nodiscard]] PHLLS getLayerSurface() const;
 
+    // [technicolor fork] Set when this state was created while its layer was still
+    // opening (fade/slide-in running). See hkRenderLayer: such state is thrown away
+    // and rebuilt once the layer settles.
+    bool m_createdWhileOpening = false;
+
   private:
     PHLLSREF     m_layerSurface;
     SP<Render::IFramebuffer> m_sampleFramebuffer;
