@@ -128,6 +128,15 @@ struct SGlobalState {
     // wide list is in scope here). Shared by the window-drag mapping and the
     // mouse-wake mapping so both live on the same sheet of water.
     Vector2D deskMax{1920.0, 1080.0};
+    // Its other corner: 0,0 unless a monitor sits at a negative position. Only
+    // the caustic pass's splat bounds read it (renderCausticTex).
+    Vector2D deskMin{0.0, 0.0};
+
+    // The warp's slope on a desktop-space grid (buildSlopeTex). Covers the
+    // whole desktop; each monitor frame refreshes its own monitor's part.
+    SP<Render::IFramebuffer> slopeFb;
+    Vector2D                 slopeOrigin{0.0, 0.0};   // desktop px of texel (0,0)'s corner
+    uint64_t                 slopeFrame = 0;          // renderFrame of the last refresh
 
     // Currents (Stable Fluids) state. The height field above is a SCALAR — it
     // has no curl, so it cannot hold an eddy no matter how it is forced. This

@@ -95,8 +95,9 @@ static void uploadThemeUniforms(const SResolveContext& ctx) {
     glUniform1f(uniforms.adaptiveBoost, resolvePresetFloat(ctx, &SPresetValues::adaptiveBoost, &SOverridableConfig::adaptiveBoost, defaults.adaptiveBoost));
 }
 
-void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IFramebuffer> sourceFramebuffer,
-                       CBox box, Vector2D& outPaddingRatio, int downscale) {
+void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IFramebuffer>& halfFramebuffer,
+                      SP<Render::IFramebuffer> sourceFramebuffer, CBox box, Vector2D& outPaddingRatio,
+                      int downscale) {
     if (!sourceFramebuffer)
         return;
     const int pad = SAMPLE_PADDING_PX;
@@ -180,7 +181,6 @@ void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IF
     // correct 4x4 average at the same final resolution, so quarter-res keeps its
     // fill-rate saving without the aliasing.
     if (downscale >= 4) {
-        static SP<Render::IFramebuffer> halfFramebuffer;
         const int halfWidth  = std::max(1, sampleWidth  * 2);
         const int halfHeight = std::max(1, sampleHeight * 2);
         if (!halfFramebuffer)
@@ -758,6 +758,16 @@ void renderTrailTex() {
 // point's parcel lands somewhere -- so the native resolution keeps all the
 // energy and the finite-sun blur below does the softening.
 static constexpr int CAUSTIC_RES = 1024;
+// VIS in Shaders.hpp: how much of the [0,1] texture q-space [0,1] spans.
+static constexpr float WAVE_VIS = 0.105f;
+// Texels splatted past the edge of what the desktop can show. Covers light
+// refracted in from outside, the finite-sun blur (radius <= 12), the coarser
+// mips the window bezels read, and the dome refraction at windows touching the
+// desktop edge (~6). Measured live against a full-lattice splat of the same
+// frame (2026-10-21, depth 4.7, veins up to 48x): 48 still missed a few
+// parcels landing from >32 texels out during strong waves; 64 was
+// bit-identical over the desktop + 16 texels in 29 of 29 checks.
+static constexpr int CAUSTIC_SPLAT_MARGIN = 64;
 
 // ============================================================================
 // BAND-LIMITED SURFACE FOR THE REFRACTION WARP
@@ -983,6 +993,32 @@ static void renderCausticTex() {
         glUniform1f(u.causticK, causticK);
         glUniform1f(u.gridN, float(CAUSTIC_RES));
 
+        // ONLY THE PART OF THE FIELD THE DESKTOP SHOWS. The glass maps desktop
+        // pixels into this texture at 0.5 + (wp - 0.5) * 2*VIS, wp being the
+        // shader's desktop-space water coordinate, so the whole desktop covers a
+        // fixed rectangle of it: at scale 3 on 4480x1440 that is ~549x176 of
+        // 1024x1024, 9%. Every point outside it carried light nobody could see,
+        // and the splat was 89% of the caustic pass's GPU time (measured
+        // 2026-10-21: 81 of 91 ms/s). Points are laid only over that rectangle
+        // plus CAUSTIC_SPLAT_MARGIN; the rest of the texture stays cleared.
+        int sx0 = 0, sy0 = 0, sx1 = CAUSTIC_RES, sy1 = CAUSTIC_RES;
+        {
+            const auto&  dMax  = st.deskMax;
+            const auto&  dMin  = st.deskMin;
+            const double scl   = cfg.shimmerScale ? static_cast<double>(**cfg.shimmerScale) : 1.0;
+            const double k     = 0.85 * scl / std::max(dMax.x, 1.0) * (2.0 * WAVE_VIS) * CAUSTIC_RES;
+            const double mid   = 0.5 * CAUSTIC_RES;
+            auto lo = [&](double v) { return std::clamp(static_cast<int>(std::floor(v)) - CAUSTIC_SPLAT_MARGIN, 0, CAUSTIC_RES); };
+            auto hi = [&](double v) { return std::clamp(static_cast<int>(std::ceil(v)) + CAUSTIC_SPLAT_MARGIN, 0, CAUSTIC_RES); };
+            sx0 = lo(mid + (dMin.x - dMax.x * 0.5) * k);
+            sx1 = hi(mid + (dMax.x - dMax.x * 0.5) * k);
+            sy0 = lo(mid + (dMin.y - dMax.y * 0.5) * k);
+            sy1 = hi(mid + (dMax.y - dMax.y * 0.5) * k);
+        }
+        const int splatW = std::max(sx1 - sx0, 0), splatH = std::max(sy1 - sy0, 0);
+        glUniform2f(u.gridOrigin, float(sx0), float(sy0));
+        glUniform1i(u.gridW, std::max(splatW, 1));
+
         glActiveTexture(GL_TEXTURE8);
         st.waveFb[st.waveCurrent]->getTexture()->bind();
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1024,7 +1060,7 @@ static void renderCausticTex() {
         // No vertex attributes anywhere in the program -- gl_VertexID is the
         // whole input -- so the default VAO is the right one to have bound.
         glBindVertexArray(0);
-        glDrawArrays(GL_POINTS, 0, CAUSTIC_RES * CAUSTIC_RES);
+        glDrawArrays(GL_POINTS, 0, splatW * splatH);
 
         g_pHyprOpenGL->setCapStatus(GL_BLEND, false);
         glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA);
@@ -1123,6 +1159,128 @@ static void renderCausticTex() {
     }
     glActiveTexture(GL_TEXTURE0);
     g_pHyprOpenGL->setViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+}
+
+// ============================================================================
+// THE WARP'S SLOPE ON A DESKTOP GRID (see waveslope.frag)
+//
+// Measured 2026-10-21 (GPU timestamps, live, water on): the glass pass went
+// from 25 to 94 ms/s with the water on, nearly all of it the 24 texture reads
+// per pixel that waveSlopeSmooth costs. The slope field is a function of
+// desktop position and time, so it is evaluated once per monitor frame on a
+// grid SLOPE_CELL_PX apart and the glass reads it with a 4-tap bicubic.
+// ============================================================================
+static constexpr double SLOPE_CELL_PX = 4.0;
+// Texels refreshed past each edge of the monitor being drawn: the bicubic
+// read reaches 2 texels out.
+static constexpr int SLOPE_MARGIN = 3;
+
+static void buildSlopeTex() {
+    auto& st = *g_pGlobalState;
+    auto& sm = st.shaderManager;
+    const auto mon = g_pHyprRenderer->m_renderData.pMonitor.lock();
+    // Once per monitor frame: every glass surface drawn in it reads the same
+    // instant of water.
+    if (!mon || st.slopeFrame == st.renderFrame)
+        return;
+    auto& sfb = st.waveSmoothFb;
+    if (!sfb || !sfb->getTexture())
+        return;
+
+    const double cell = SLOPE_CELL_PX;
+    const Vector2D lo{st.deskMin.x - SLOPE_MARGIN * cell, st.deskMin.y - SLOPE_MARGIN * cell};
+    const int W = static_cast<int>(std::ceil((st.deskMax.x - st.deskMin.x) / cell)) + 2 * SLOPE_MARGIN;
+    const int H = static_cast<int>(std::ceil((st.deskMax.y - st.deskMin.y) / cell)) + 2 * SLOPE_MARGIN;
+    if (W <= 0 || H <= 0)
+        return;
+
+    GLint prevFbo = 0, prevVp[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    glGetIntegerv(GL_VIEWPORT, prevVp);
+    // Offscreen pass: never scissored by screen damage, never blended (see
+    // renderCausticTex and blurBackground for what both of those cost).
+    const GLboolean prevScissor = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean prevBlend   = glIsEnabled(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    g_pHyprOpenGL->setCapStatus(GL_BLEND, false);
+
+    auto& fb = st.slopeFb;
+    if (!fb)
+        fb = g_pHyprRenderer->createFB("hyprwater-slope");
+    if (fb->m_size.x != W || fb->m_size.y != H) {
+        fb->alloc(W, H, DRM_FORMAT_ABGR16161616F);
+        // A fresh allocation is recycled VRAM, which reads as NaN or huge
+        // values. Only this monitor's part is refreshed below; zero the rest
+        // so another monitor's first read of its part is calm, not garbage.
+        if (fb->getTexture() && fbId(fb) != 0) {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbId(fb));
+            GLfloat prevClear[4];
+            glGetFloatv(GL_COLOR_CLEAR_VALUE, prevClear);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glClearColor(prevClear[0], prevClear[1], prevClear[2], prevClear[3]);
+        }
+    }
+    if (fb->getTexture() && fbId(fb) != 0) {
+        st.slopeFrame  = st.renderFrame;
+        st.slopeOrigin = lo;
+
+        const auto& cfg = st.config;
+        const auto& u   = sm.slopeUniforms;
+        auto sh = g_pHyprOpenGL->useShader(sm.slopeShader);
+        sh->setUniformMatrix3fv(SHADER_PROJ, 1, GL_FALSE, FULLSCREEN_PROJECTION);
+        // Units 8-10, as every mid-frame offscreen pass: the compositor caches
+        // what it thinks is bound on the low units (see renderCausticTex).
+        glUniform1i(u.waveSmoothTex, 8);
+        glUniform1i(u.trailTex, 9);
+        glUniform1i(u.velTexG, 10);
+        glUniform1f(u.waveSmoothTexel, 1.0f / static_cast<float>(WAVE_SMOOTH_RES));
+        glUniform1f(u.waveSubFrac, st.waveSubFrac);
+        glUniform1f(u.waveBias, st.waveBias);
+        glUniform4f(u.winWake, 0.f, 0.f, 0.f, 0.f);
+        glUniform2f(u.deskSize, static_cast<float>(st.deskMax.x), static_cast<float>(st.deskMax.y));
+        glUniform1f(u.shimmerScale, cfg.shimmerScale ? static_cast<float>(**cfg.shimmerScale) : 1.0f);
+        glUniform2f(u.slopeOrigin, static_cast<float>(lo.x), static_cast<float>(lo.y));
+        glUniform1f(u.slopeCell, static_cast<float>(cell));
+        auto& vfb = st.fluidVelFb[st.fluidVelCurrent];
+        const bool velOk = st.flowDt > 0.0f && vfb && vfb->getTexture();
+        glUniform1f(u.flowShift, velOk ? st.flowDt : 0.0f);
+
+        auto bindLinear = [](GLenum unit, const SP<Render::IFramebuffer>& f) {
+            glActiveTexture(unit);
+            f->getTexture()->bind();
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        };
+        bindLinear(GL_TEXTURE8, sfb);
+        if (st.trailFb && st.trailFb->getTexture())
+            bindLinear(GL_TEXTURE9, st.trailFb);
+        if (velOk)
+            bindLinear(GL_TEXTURE10, vfb);
+        glActiveTexture(GL_TEXTURE0);
+
+        // This monitor's texels only; gl_FragCoord stays in whole-texture
+        // coordinates, so the viewport just picks which ones get written.
+        const int x0 = std::clamp(static_cast<int>(std::floor((mon->m_position.x - lo.x) / cell)) - SLOPE_MARGIN, 0, W);
+        const int x1 = std::clamp(static_cast<int>(std::ceil((mon->m_position.x + mon->m_size.x - lo.x) / cell)) + SLOPE_MARGIN, 0, W);
+        const int y0 = std::clamp(static_cast<int>(std::floor((mon->m_position.y - lo.y) / cell)) - SLOPE_MARGIN, 0, H);
+        const int y1 = std::clamp(static_cast<int>(std::ceil((mon->m_position.y + mon->m_size.y - lo.y) / cell)) + SLOPE_MARGIN, 0, H);
+        if (x1 > x0 && y1 > y0) {
+            glBindFramebuffer(GL_FRAMEBUFFER, fbId(fb));
+            g_pHyprOpenGL->setViewport(x0, y0, x1 - x0, y1 - y0);
+            glBindVertexArray(sh->getUniformLocation(SHADER_SHADER_VAO));
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glBindVertexArray(0);
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+    g_pHyprOpenGL->setViewport(prevVp[0], prevVp[1], prevVp[2], prevVp[3]);
+    g_pHyprOpenGL->setCapStatus(GL_BLEND, prevBlend);
+    if (prevScissor)
+        glEnable(GL_SCISSOR_TEST);
 }
 
 void stepWaveSim() {
@@ -1748,10 +1906,18 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFram
 
     const auto& blurUniforms = shaderManager.blurUniforms;
 
+    // ONE PASS AT THE COMBINED WIDTH. Gaussians compose: n passes of sigma
+    // are one pass of sigma*sqrt(n), so `iterations` keeps meaning "this much
+    // blur" while the work drops from 2n full-target passes of r taps to two
+    // of r*sqrt(n): at the live settings (4 iterations, radius 4.1) 56 taps a
+    // texel over 8 render-target round trips became 22 over 2. Checked
+    // against the iterated result on the same frame (2026-10-21, see
+    // QUEUE.md 40-3d).
+    const float passRadius = radius * std::sqrt(static_cast<float>(iterations));
     auto shader = g_pHyprOpenGL->useShader(shaderManager.blurShader);
     shader->setUniformMatrix3fv(SHADER_PROJ, 1, GL_FALSE, FULLSCREEN_PROJECTION);
     shader->setUniformInt(SHADER_TEX, 0);
-    glUniform1f(blurUniforms.radius, radius);
+    glUniform1f(blurUniforms.radius, passRadius);
     glBindVertexArray(shader->getUniformLocation(SHADER_SHADER_VAO));
     g_pHyprOpenGL->setViewport(0, 0, width, height);
     glActiveTexture(GL_TEXTURE0);
@@ -1804,8 +1970,8 @@ void blurBackground(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFram
     const GLboolean blurBlend = glIsEnabled(GL_BLEND);
     glDisable(GL_BLEND);
 
-    // Ping-pong at full resolution: sampleFramebuffer ↔ blurTempFramebuffer
-    for (int iteration = 0; iteration < iterations; iteration++) {
+    // Separable: sampleFramebuffer -> blurTempFramebuffer -> sampleFramebuffer.
+    {
         // Horizontal pass: sampleFramebuffer → blurTempFramebuffer
         glBindFramebuffer(GL_FRAMEBUFFER, fbId(blurTempFramebuffer));
         sampleFramebuffer->getTexture()->bind();
@@ -1898,6 +2064,7 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
             stepFluidFrame();
             renderTrailTex();
             renderCausticTex();   // after the trail: it reads it
+            buildSlopeTex();      // after the caustic: it rebuilds the smooth field
         }
     }
 
@@ -1929,6 +2096,9 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
         monOff = mon->m_position;
         deskMax.x = std::max(deskMax.x, mon->m_position.x + mon->m_size.x);
         deskMax.y = std::max(deskMax.y, mon->m_position.y + mon->m_size.y);
+        auto& deskMin = g_pGlobalState->deskMin;
+        deskMin.x = std::min(deskMin.x, mon->m_position.x);
+        deskMin.y = std::min(deskMin.y, mon->m_position.y);
     }
     desk = deskMax;
     // rawBox, not transformedBox: rawBox is what gets projected to the target,
@@ -2135,6 +2305,22 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
             // as a CONSTANT, and only this field's GRADIENT is ever used, so a
             // frame before the texture exists is calm glass, never garbage.
             glUniform1i(uniforms.waveSmoothTex, 11);
+            // The warp's precomputed slope (buildSlopeTex), unit 12. Unbound
+            // before the first build, which samples as zero slope: calm glass.
+            glUniform1i(uniforms.slopeTex, 12);
+            if (auto& slfb = g_pGlobalState->slopeFb; slfb && slfb->getTexture()) {
+                glActiveTexture(GL_TEXTURE12);
+                slfb->getTexture()->bind();
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glActiveTexture(GL_TEXTURE0);
+                glUniform2f(uniforms.slopeOrigin, static_cast<float>(g_pGlobalState->slopeOrigin.x),
+                            static_cast<float>(g_pGlobalState->slopeOrigin.y));
+                glUniform1f(uniforms.slopeCell, static_cast<float>(SLOPE_CELL_PX));
+                glUniform2f(uniforms.slopeSize, static_cast<float>(slfb->m_size.x), static_cast<float>(slfb->m_size.y));
+            }
             glUniform1f(uniforms.waveSmoothTexel, 1.0f / static_cast<float>(WAVE_SMOOTH_RES));
             // The SAME number the splat pass transported light with. See
             // waterCausticK(): deriving it twice is how the warp ended up 2x to

@@ -64,8 +64,12 @@ struct SMaskInfo {
     float    alphaThreshold = 0.001f;
 };
 
-void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IFramebuffer> sourceFramebuffer,
-                       CBox box, Vector2D& outPaddingRatio, int downscale = 1);
+// halfFramebuffer is the caller's own scratch for the quarter-res path's
+// intermediate 2x step, sized to its sample. One shared buffer was
+// reallocated every time two differently sized surfaces drew in a row.
+void sampleBackground(SP<Render::IFramebuffer>& sampleFramebuffer, SP<Render::IFramebuffer>& halfFramebuffer,
+                      SP<Render::IFramebuffer> sourceFramebuffer, CBox box, Vector2D& outPaddingRatio,
+                      int downscale = 1);
 
 // tempFramebuffer is the caller's OWN ping-pong scratch. It must not be shared
 // between callers: it is sized to the sample being blurred, so a shared one

@@ -5,6 +5,141 @@
 #include <string>
 
 inline const std::unordered_map<std::string, const char*> SHADERS = {
+    {"waveread.glsl", R"GLSL(
+// Shared by liquidglass.frag and waveslope.frag (spliced in by
+// CShaderManager::loadShaderSource). Needs, declared by the includer: VIS,
+// velTexG, flowShift, waveSubFrac, waveBias, winWake, winRectSim, trailTex.
+// BICUBIC HEIGHT READ (cubic B-spline, 4 bilinear taps).
+// Bilinear filtering is only C0: the VALUE is continuous across a texel border
+// but the DERIVATIVE jumps there, and the second derivative is zero inside each
+// cell and a delta on the seams. Everything visible here is built from
+// derivatives of h — waveSlope for the warp and the glint, waveHessian for the
+// caustic — and the caustic divides its second differences by e*e, so those
+// seams get multiplied by a large number and printed. As a window is dragged
+// the sample points slide across seams and that shows up as the surface
+// snapping under the moving window, worst over high-frequency content like
+// text. Magnification makes it worse and this surface is magnified hard: at
+// VIS=0.105 on a 1024 grid only ~215 texels are stretched across the screen.
+//
+// A cubic B-spline kernel is C2, so both derivatives exist and vary smoothly
+// across cells — the seams stop existing rather than being blurred over. The
+// standard 4-tap formulation (Sigg & Hadwiger) folds the 16 point samples into
+// 4 offset BILINEAR fetches, so this is 4 texture reads, not 16. B-spline
+// slightly smooths rather than interpolating the samples exactly, which is the
+// right trade here: an exactly-interpolating Catmull-Rom is only C1 and leaves
+// the caustic's second derivative discontinuous, which is the actual problem.
+vec4 texBicubic(sampler2D t, vec2 uv, vec2 texSize) {
+    vec2 coord = uv * texSize - 0.5;
+    vec2 f     = fract(coord);
+    coord     -= f;
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = (1.0 / 6.0) * (-f3 + 3.0 * f2 - 3.0 * f + 1.0);
+    vec2 w1 = (1.0 / 6.0) * (3.0 * f3 - 6.0 * f2 + 4.0);
+    vec2 w2 = (1.0 / 6.0) * (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0);
+    vec2 w3 = (1.0 / 6.0) * f3;
+    vec2 s0 = w0 + w1;
+    vec2 s1 = w2 + w3;
+    vec2 o0 = ((w1 / s0) - 1.0 + coord + 0.5) / texSize;
+    vec2 o1 = ((w3 / s1) + 1.0 + coord + 0.5) / texSize;
+    vec4 a = texture(t, vec2(o0.x, o0.y));
+    vec4 b = texture(t, vec2(o1.x, o0.y));
+    vec4 c = texture(t, vec2(o0.x, o1.y));
+    vec4 d = texture(t, vec2(o1.x, o1.y));
+    return mix(mix(d, c, s0.x), mix(b, a, s0.x), s0.y);
+}
+
+// Instantaneous bow wave of a dragged window: crest hugging the leading
+// edge, trough behind, zero at the centre and far away. Analytic in the
+// window's live position, so it rides with the drag at full frame rate
+// regardless of how slowly the sim steps — in a real fluid the
+// incompressible near-field response IS instantaneous; only shed waves
+// (the sim's job) propagate slowly.
+float waveBow(vec2 uv) {
+    if (winWake.z <= 0.001)
+        return 0.0;
+    vec2  bd  = (uv - winRectSim.xy) / max(winRectSim.zw, vec2(1e-5));
+    // Smooth p=4 superellipse metric. max(|x|,|y|) has gradient CREASES
+    // along the diagonals, and the caustic pass printed them as a bright
+    // X across every dragged window. A p-norm rounds the corners and is
+    // smooth everywhere the envelope is nonzero.
+    vec2  b2  = bd * bd;
+    vec2  b4  = b2 * b2;
+    float box = pow(b4.x + b4.y, 0.25);
+    // Crest INSIDE the border: the outer falloff ends just past the edge
+    // so the displacement never asks the backdrop sampler for pixels far
+    // outside its padded region — pushing height right AT the border was
+    // resurrecting the old top-edge smear on tall windows.
+    float env = smoothstep(1.35, 0.95, box) * smoothstep(0.25, 0.8, box);
+    float along = clamp(dot(uv - winRectSim.xy, winWake.xy)
+                        / max(length(winRectSim.zw), 1e-5), -1.0, 1.0);
+    return winWake.z * along * env * 0.10;
+}
+
+float waveH(sampler2D hTex, float hTexel, vec2 q) {
+    // NEITHER fract() NOR clamp(). fract() wrapped, putting a hard seam wherever
+    // the coordinate crossed 0/1 — which the edge-refraction zone then stretched
+    // into blocky banding along the border. clamp() would instead freeze the
+    // value out there, i.e. a flat dead band at the edge: a different artifact,
+    // not a fix.
+    // The mapping is simply continuous. VIS=0.34 means q in [0,1] uses only the
+    // middle third of the texture, so q can wander well outside [0,1] — which is
+    // exactly what refraction does to it near an edge — and still land inside
+    // real simulated water. GL_CLAMP_TO_EDGE only ever engages far outside the
+    // window, where nothing is drawn.
+    vec2 uv = 0.5 + (q - 0.5) * (2.0 * VIS);
+    // NOTE: a quintic-ease "smooth bilinear" remap was tried here and REVERTED
+    // — it flattens each texel's interior and concentrates the change at the
+    // borders, which reads as a LOWER-resolution surface, not a smoother one.
+    // The right tool for magnification is a genuine bicubic, if it is ever
+    // worth its taps.
+    // R is the newest state, G the one before it. Blending by how far we are
+    // between them makes the motion continuous even when a simulation step
+    // spans many frames — which is exactly the case at low speed. Without this,
+    // slowing the water down would make it tick between discrete states.
+    // ADVECTION CATCH-UP. The sim advects the whole height field by one step's
+    // worth of flow, in a single jump, when it steps — at the bottom of the
+    // speed slider that is one lurch per SECOND, and it was the low-speed tick
+    // (proven by bisection: disabling this advection removed it, disabling the
+    // interpolation below did not). The two height channels are BOTH read at
+    // the advected point by the sim, so the pair the mix() blends are already
+    // in the same spatial frame as each other. The earlier code slid them in
+    // OPPOSITE directions, inventing a displacement between two co-located
+    // fields while leaving the real per-step jump uncompensated.
+    //
+    // Both taps therefore ride the SAME offset: walk the whole field forward
+    // by the fraction of a step already elapsed, so by the time the step lands
+    // the picture is already exactly where the sim is about to put it and the
+    // jump is spent. Live velocity, not a per-step snapshot: what has to match
+    // at the boundary is the flow the NEXT step will advect by, and the live
+    // field an instant before that step is the best estimate of it.
+    vec2 duv = flowShift > 0.0
+             ? texture(velTexG, uv).rg * (flowShift * waveSubFrac)
+             : vec2(0.0);
+    // C2 read: see texBicubic above. hTexel is 1/grid, so its reciprocal
+    // is the grid size the kernel needs.
+    vec2 hh = texBicubic(hTex, uv - duv, vec2(1.0 / max(hTexel, 1e-9))).rg - waveBias;
+    float h = mix(hh.y, hh.x, waveSubFrac);
+    h += waveBow(uv);
+    // The stroke a drag has deposited since the last simulation step, rendered
+    // analytically until the sim absorbs it. The spend zeroes the pending
+    // amount in the same frame the deposit lands in the texture, so the
+    // handoff is seamless — and slow water responds to dragging continuously
+    // at ANY simulation speed, instead of ticking once per rare step. This is
+    // the piece sub-stepping alone could not provide at the bottom of the
+    // speed slider.
+    // One texture read instead of a per-stencil-tap capsule loop: the trail
+    // pass already summed every segment this frame, including the
+    // just-absorbed one at its crossfade complement. Y-FLIPPED on purpose:
+    // the trail FBO's row order is mirrored relative to this shader's uv
+    // (verified empirically — a top-edge drag rendered its wake at the
+    // bottom until this flip; the sim texture avoids the issue only because
+    // it writes and reads itself with the same convention).
+    h += texture(trailTex, vec2(uv.x, 1.0 - uv.y)).r;
+    return h;
+}
+)GLSL"},
+
     {"liquidglass.frag", R"GLSL(
 #version 300 es
 precision highp float;
@@ -84,6 +219,13 @@ uniform float waveTexel;     // 1 / simulation grid size, for the C1 read
 // the sim grid), built once per caustic pass.
 uniform sampler2D waveSmoothTex;
 uniform float waveSmoothTexel;   // 1 / smoothed grid size
+// waveSlopeSmooth without this window's bow wave, precomputed per desktop
+// texel (waveslope.frag). Texel (i,j) centre is slopeOrigin + (i,j)+0.5
+// cells, slopeCell desktop px apart, slopeSize texels in all.
+uniform sampler2D slopeTex;
+uniform vec2  slopeOrigin;
+uniform float slopeCell;
+uniform vec2  slopeSize;
 // THE displacement coefficient, in wave-field units — the exact number the
 // caustic splat pass transported light with. Passed in rather than re-derived
 // here: a bright vein and the squeeze in the image under it are the same event,
@@ -239,131 +381,7 @@ const float PHI = 1.61803398875;
 // the corner of your eye.
 const float VIS = 0.105;
 
-// BICUBIC HEIGHT READ (cubic B-spline, 4 bilinear taps).
-// Bilinear filtering is only C0: the VALUE is continuous across a texel border
-// but the DERIVATIVE jumps there, and the second derivative is zero inside each
-// cell and a delta on the seams. Everything visible here is built from
-// derivatives of h — waveSlope for the warp and the glint, waveHessian for the
-// caustic — and the caustic divides its second differences by e*e, so those
-// seams get multiplied by a large number and printed. As a window is dragged
-// the sample points slide across seams and that shows up as the surface
-// snapping under the moving window, worst over high-frequency content like
-// text. Magnification makes it worse and this surface is magnified hard: at
-// VIS=0.105 on a 1024 grid only ~215 texels are stretched across the screen.
-//
-// A cubic B-spline kernel is C2, so both derivatives exist and vary smoothly
-// across cells — the seams stop existing rather than being blurred over. The
-// standard 4-tap formulation (Sigg & Hadwiger) folds the 16 point samples into
-// 4 offset BILINEAR fetches, so this is 4 texture reads, not 16. B-spline
-// slightly smooths rather than interpolating the samples exactly, which is the
-// right trade here: an exactly-interpolating Catmull-Rom is only C1 and leaves
-// the caustic's second derivative discontinuous, which is the actual problem.
-vec4 texBicubic(sampler2D t, vec2 uv, vec2 texSize) {
-    vec2 coord = uv * texSize - 0.5;
-    vec2 f     = fract(coord);
-    coord     -= f;
-    vec2 f2 = f * f;
-    vec2 f3 = f2 * f;
-    vec2 w0 = (1.0 / 6.0) * (-f3 + 3.0 * f2 - 3.0 * f + 1.0);
-    vec2 w1 = (1.0 / 6.0) * (3.0 * f3 - 6.0 * f2 + 4.0);
-    vec2 w2 = (1.0 / 6.0) * (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0);
-    vec2 w3 = (1.0 / 6.0) * f3;
-    vec2 s0 = w0 + w1;
-    vec2 s1 = w2 + w3;
-    vec2 o0 = ((w1 / s0) - 1.0 + coord + 0.5) / texSize;
-    vec2 o1 = ((w3 / s1) + 1.0 + coord + 0.5) / texSize;
-    vec4 a = texture(t, vec2(o0.x, o0.y));
-    vec4 b = texture(t, vec2(o1.x, o0.y));
-    vec4 c = texture(t, vec2(o0.x, o1.y));
-    vec4 d = texture(t, vec2(o1.x, o1.y));
-    return mix(mix(d, c, s0.x), mix(b, a, s0.x), s0.y);
-}
-
-float waveH(sampler2D hTex, float hTexel, vec2 q) {
-    // NEITHER fract() NOR clamp(). fract() wrapped, putting a hard seam wherever
-    // the coordinate crossed 0/1 — which the edge-refraction zone then stretched
-    // into blocky banding along the border. clamp() would instead freeze the
-    // value out there, i.e. a flat dead band at the edge: a different artifact,
-    // not a fix.
-    // The mapping is simply continuous. VIS=0.34 means q in [0,1] uses only the
-    // middle third of the texture, so q can wander well outside [0,1] — which is
-    // exactly what refraction does to it near an edge — and still land inside
-    // real simulated water. GL_CLAMP_TO_EDGE only ever engages far outside the
-    // window, where nothing is drawn.
-    vec2 uv = 0.5 + (q - 0.5) * (2.0 * VIS);
-    // NOTE: a quintic-ease "smooth bilinear" remap was tried here and REVERTED
-    // — it flattens each texel's interior and concentrates the change at the
-    // borders, which reads as a LOWER-resolution surface, not a smoother one.
-    // The right tool for magnification is a genuine bicubic, if it is ever
-    // worth its taps.
-    // R is the newest state, G the one before it. Blending by how far we are
-    // between them makes the motion continuous even when a simulation step
-    // spans many frames — which is exactly the case at low speed. Without this,
-    // slowing the water down would make it tick between discrete states.
-    // ADVECTION CATCH-UP. The sim advects the whole height field by one step's
-    // worth of flow, in a single jump, when it steps — at the bottom of the
-    // speed slider that is one lurch per SECOND, and it was the low-speed tick
-    // (proven by bisection: disabling this advection removed it, disabling the
-    // interpolation below did not). The two height channels are BOTH read at
-    // the advected point by the sim, so the pair the mix() blends are already
-    // in the same spatial frame as each other. The earlier code slid them in
-    // OPPOSITE directions, inventing a displacement between two co-located
-    // fields while leaving the real per-step jump uncompensated.
-    //
-    // Both taps therefore ride the SAME offset: walk the whole field forward
-    // by the fraction of a step already elapsed, so by the time the step lands
-    // the picture is already exactly where the sim is about to put it and the
-    // jump is spent. Live velocity, not a per-step snapshot: what has to match
-    // at the boundary is the flow the NEXT step will advect by, and the live
-    // field an instant before that step is the best estimate of it.
-    vec2 duv = flowShift > 0.0
-             ? texture(velTexG, uv).rg * (flowShift * waveSubFrac)
-             : vec2(0.0);
-    // C2 read: see texBicubic above. hTexel is 1/grid, so its reciprocal
-    // is the grid size the kernel needs.
-    vec2 hh = texBicubic(hTex, uv - duv, vec2(1.0 / max(hTexel, 1e-9))).rg - waveBias;
-    float h = mix(hh.y, hh.x, waveSubFrac);
-    // Instantaneous bow wave of a dragged window: crest hugging the leading
-    // edge, trough behind, zero at the centre and far away. Analytic in the
-    // window's live position, so it rides with the drag at full frame rate
-    // regardless of how slowly the sim steps — in a real fluid the
-    // incompressible near-field response IS instantaneous; only shed waves
-    // (the sim's job) propagate slowly.
-    if (winWake.z > 0.001) {
-        vec2  bd  = (uv - winRectSim.xy) / max(winRectSim.zw, vec2(1e-5));
-        // Smooth p=4 superellipse metric. max(|x|,|y|) has gradient CREASES
-        // along the diagonals, and the caustic pass printed them as a bright
-        // X across every dragged window. A p-norm rounds the corners and is
-        // smooth everywhere the envelope is nonzero.
-        vec2  b2  = bd * bd;
-        vec2  b4  = b2 * b2;
-        float box = pow(b4.x + b4.y, 0.25);
-        // Crest INSIDE the border: the outer falloff ends just past the edge
-        // so the displacement never asks the backdrop sampler for pixels far
-        // outside its padded region — pushing height right AT the border was
-        // resurrecting the old top-edge smear on tall windows.
-        float env = smoothstep(1.35, 0.95, box) * smoothstep(0.25, 0.8, box);
-        float along = clamp(dot(uv - winRectSim.xy, winWake.xy)
-                            / max(length(winRectSim.zw), 1e-5), -1.0, 1.0);
-        h += winWake.z * along * env * 0.10;
-    }
-    // The stroke a drag has deposited since the last simulation step, rendered
-    // analytically until the sim absorbs it. The spend zeroes the pending
-    // amount in the same frame the deposit lands in the texture, so the
-    // handoff is seamless — and slow water responds to dragging continuously
-    // at ANY simulation speed, instead of ticking once per rare step. This is
-    // the piece sub-stepping alone could not provide at the bottom of the
-    // speed slider.
-    // One texture read instead of a per-stencil-tap capsule loop: the trail
-    // pass already summed every segment this frame, including the
-    // just-absorbed one at its crossfade complement. Y-FLIPPED on purpose:
-    // the trail FBO's row order is mirrored relative to this shader's uv
-    // (verified empirically — a top-edge drag rendered its wake at the
-    // bottom until this flip; the sim texture avoids the issue only because
-    // it writes and reads itself with the same convention).
-    h += texture(trailTex, vec2(uv.x, 1.0 - uv.y)).r;
-    return h;
-}
+#include "waveread.glsl"
 
 // The sharp surface: what the caustic and everything else reads.
 float waveH(vec2 q)       { return waveH(waveTex, waveTexel, q); }
@@ -397,6 +415,22 @@ float waveHSmooth(vec2 q) { return waveH(waveSmoothTex, waveSmoothTexel, q); }
 vec2 waveSlope(vec2 q, float e) {
     return vec2(waveH(q + vec2(e, 0.0)) - waveH(q - vec2(e, 0.0)),
                 waveH(q + vec2(0.0, e)) - waveH(q - vec2(0.0, e))) / (2.0 * e);
+}
+
+// waveSlopeSmooth(q, e) at desktop point dp, from the precomputed grid plus
+// THIS window's bow wave by the same central differences. 4 + (dragging
+// only) ALU-only bow taps instead of 24 texture reads. The bicubic is a
+// B-spline, so it smooths the grid by ~0.6 cell; at the cell size used that
+// moves the warp by well under a pixel (measured, see GlassRenderer.cpp).
+vec2 waveSlopeSmoothGrid(vec2 dp, vec2 q, float e) {
+    vec2 g = texBicubic(slopeTex, (dp - slopeOrigin) / (slopeSize * slopeCell), slopeSize).rg;
+    if (winWake.z > 0.001) {
+        vec2 ex = vec2(e, 0.0), ey = vec2(0.0, e);
+        vec2 c  = 0.5 + (q - 0.5) * (2.0 * VIS);
+        g += vec2(waveBow(c + ex * (2.0 * VIS)) - waveBow(c - ex * (2.0 * VIS)),
+                  waveBow(c + ey * (2.0 * VIS)) - waveBow(c - ey * (2.0 * VIS))) / (2.0 * e);
+    }
+    return g;
 }
 
 vec2 waveSlopeSmooth(vec2 q, float e) {
@@ -714,7 +748,8 @@ void main() {
             // curve below — and a physically over-steep surface is not that.
             // BAND-LIMITED read — see waveHSmooth(). The sharp field folds the
             // backdrop map over itself and prints every wave twice.
-            waveGrad = waveSlopeSmooth(wpBase, 0.0150) * min(shimmerIntensity, 1.0);
+            waveGrad = waveSlopeSmoothGrid(winOrigin + uvG * winSize, wpBase, 0.0150)
+                     * min(shimmerIntensity, 1.0);
             float qToPx = deskSize.x / max(0.85 * shimmerScale, 1e-4);
             waveWarp = waveGrad * (causticK * qToPx) / max(fullSize, vec2(1.0));
 
@@ -1698,7 +1733,9 @@ uniform float waveSubFrac;
 uniform float waveBias;
 uniform float flowShift;
 uniform float causticK;       // lens coefficient (depth * Snell * scale)
-uniform float gridN;          // points per side == target texels per side
+uniform float gridN;          // target texels per side
+uniform vec2  gridOrigin;     // first splatted texel: points cover only the
+uniform int   gridW;          // rect the desktop can show, gridW points a row
 
 flat out vec2 vLand;          // landing point, target pixel coords
 
@@ -1716,9 +1753,11 @@ float waveH(vec2 q) {
 }
 
 void main() {
-    float fid = float(gl_VertexID);
-    float iy  = floor(fid / gridN);
-    float ix  = fid - iy * gridN;
+    // Integer division: gridW is not a power of two, and float floor(fid/gridW)
+    // can land one short at an exact multiple.
+    int   iyI = gl_VertexID / gridW;
+    float iy  = float(iyI);
+    float ix  = float(gl_VertexID - iyI * gridW);
     // One point per target texel, on the plain lattice. With the BILINEAR
     // deposit below, still water lands exactly 1.0 in every texel -- no
     // counting noise at all. (Jitter was tried here twice to fight a woven
@@ -1726,7 +1765,7 @@ void main() {
     // the weave for connected mottle, low-discrepancy-by-linear-index
     // aliased into curtains. At vein-regime lens strength the displacements
     // are a few texels and the plain lattice shows no weave to begin with.)
-    vec2 tuv  = (vec2(ix, iy) + 0.5) / gridN;
+    vec2 tuv  = (vec2(ix, iy) + gridOrigin + 0.5) / gridN;
 
     // Same q-space as the glass shader's warp, so the light lands exactly
     // where the warped image says it moved.
@@ -1769,6 +1808,54 @@ void main() {
     float w = max(0.0, 1.0 - abs(gl_FragCoord.x - vLand.x))
             * max(0.0, 1.0 - abs(gl_FragCoord.y - vLand.y));
     fragColor = vec4(w, w, w, 0.0);
+}
+)GLSL"},
+
+    {"waveslope.frag", R"GLSL(
+#version 300 es
+precision highp float;
+
+// THE WARP'S SLOPE, ONCE PER TEXEL INSTEAD OF ONCE PER SCREEN PIXEL.
+//
+// The refraction warp reads grad(h) of the band-limited surface by central
+// differences: four smoothed-height reads, each a 4-tap bicubic plus a flow
+// tap and a trail tap — 24 texture reads for every glass pixel, every frame.
+// That field depends on desktop position and time only (a dragged window's
+// own bow wave is the exception, and the glass adds that analytically), so it
+// is evaluated here on a desktop-space grid, slopeCell pixels apart, over the
+// monitor being drawn, and the glass reads it back with one 4-tap bicubic.
+// Same functions (waveread.glsl), same arm, same coefficients.
+uniform sampler2D waveSmoothTex;
+uniform float     waveSmoothTexel;
+uniform sampler2D trailTex;
+uniform sampler2D velTexG;
+uniform float     flowShift;
+uniform float     waveSubFrac;
+uniform float     waveBias;
+uniform vec4      winWake;      // always 0 here — see above
+uniform vec4      winRectSim;
+uniform vec2      deskSize;
+uniform float     shimmerScale;
+uniform vec2      slopeOrigin;  // desktop px of texel (0,0)'s outer corner
+uniform float     slopeCell;    // desktop px per texel
+
+layout(location = 0) out vec4 fragColor;
+
+const float VIS = 0.105;
+
+#include "waveread.glsl"
+
+void main() {
+    // gl_FragCoord is the texel CENTRE; the glass samples with the same
+    // convention, (dp - slopeOrigin) / (size * slopeCell).
+    vec2 dp = slopeOrigin + gl_FragCoord.xy * slopeCell;
+    // wpBase, exactly as liquidglass.frag forms it.
+    vec2 q = 0.5 + (dp - deskSize * 0.5) / max(deskSize.x, 1.0) * (0.85 * shimmerScale);
+    const float e = 0.0150;
+    vec2 g = vec2(waveH(waveSmoothTex, waveSmoothTexel, q + vec2(e, 0.0)) - waveH(waveSmoothTex, waveSmoothTexel, q - vec2(e, 0.0)),
+                  waveH(waveSmoothTex, waveSmoothTexel, q + vec2(0.0, e)) - waveH(waveSmoothTex, waveSmoothTexel, q - vec2(0.0, e)))
+           / (2.0 * e);
+    fragColor = vec4(g, 0.0, 1.0);
 }
 )GLSL"},
 
@@ -1852,7 +1939,10 @@ void main() {
     // 8 that ceiling landed at blur_strength ~1.33, well below the slider's max
     // of 2.0, so the top third of the slider did nothing. 16 covers the whole
     // range (strength 2.0 -> radius 12 at half-res sampling).
-    int samples = min(int(ceil(blurRadius)), 16);
+    // 40 since the window blur became ONE pass at the combined width of its
+    // iterations (radius * sqrt(n), see blurBackground): strength 5 with 5
+    // iterations is radius 33.5 at quarter-res.
+    int samples = min(int(ceil(blurRadius)), 40);
 
     // Center tap
     float w0 = 1.0;

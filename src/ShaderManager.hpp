@@ -17,6 +17,10 @@ struct SGlassUniforms {
     GLint waveTexel                = -1;
     GLint waveSmoothTex            = -1;
     GLint waveSmoothTexel          = -1;
+    GLint slopeTex                 = -1;
+    GLint slopeOrigin              = -1;
+    GLint slopeCell                = -1;
+    GLint slopeSize                = -1;
     GLint causticK                 = -1;
     GLint winWake                  = -1;
     GLint winRectSim               = -1;
@@ -64,6 +68,21 @@ struct SAdaptiveLumaUniforms {
     GLint seedPrev  = -1;
 };
 
+struct SSlopeUniforms {
+    GLint waveSmoothTex   = -1;
+    GLint waveSmoothTexel = -1;
+    GLint trailTex        = -1;
+    GLint velTexG         = -1;
+    GLint flowShift       = -1;
+    GLint waveSubFrac     = -1;
+    GLint waveBias        = -1;
+    GLint winWake         = -1;
+    GLint deskSize        = -1;
+    GLint shimmerScale    = -1;
+    GLint slopeOrigin     = -1;
+    GLint slopeCell       = -1;
+};
+
 struct SBlurUniforms {
     GLint direction = -1;
     GLint radius    = -1;
@@ -98,6 +117,8 @@ struct SCausticUniforms {
     GLint waveSubFrac = -1;
     GLint waveBias    = -1;
     GLint gridN       = -1;
+    GLint gridOrigin  = -1;
+    GLint gridW       = -1;
     GLint flowShift   = -1;
     GLint causticK    = -1;
 };
@@ -139,6 +160,9 @@ class CShaderManager {
     SP<CShader>      causticShader = makeShared<CShader>();
     SCausticUniforms causticUniforms;
 
+    SP<CShader>    slopeShader = makeShared<CShader>();
+    SSlopeUniforms slopeUniforms;
+
     SP<CShader>    fluidAdvectShader     = makeShared<CShader>();
     SP<CShader>    fluidDivergenceShader = makeShared<CShader>();
     SP<CShader>    fluidJacobiShader     = makeShared<CShader>();
@@ -156,4 +180,5 @@ class CShaderManager {
     [[nodiscard]] bool compileFluidShaders();
     [[nodiscard]] bool compileTrailShader();
     [[nodiscard]] bool compileCausticShader();
+    [[nodiscard]] bool compileSlopeShader();
 };

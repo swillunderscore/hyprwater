@@ -95,21 +95,22 @@ void CGlassDecoration::draw(PHLMONITOR monitor, float const& alpha) {
     if (!g_pGlobalState || !resolveEnabled())
         return;
 
-    // With the adaptive dim on, the glass must redraw WHOLE every frame. Damage
-    // only re-renders part of it, so the rest keeps pixels rendered at an
-    // earlier moment — and the compositor alternates swapchain buffers holding
-    // those two moments. Undimmed the two are near enough to be invisible;
-    // dimming widens the gap between them and the boundary row visibly toggles
-    // between two values. Costs a full redraw per frame (~3% GPU here) and buys
-    // a stable edge.
-    if (const auto& adCfg = g_pGlobalState->config;
-        adCfg.adaptiveTint && **adCfg.adaptiveTint > 0.001f) {
-        const bool termOnly =
-            adCfg.adaptiveTintTerminalsOnly && **adCfg.adaptiveTintTerminalsOnly;
-        const auto w = m_window.lock();
-        if (!termOnly || !w || isTerminalClass(w->m_class))
-            damageEntire();
-    }
+    // With the adaptive dim on, any frame that redraws part of this glass must
+    // redraw ALL of it. Damage only re-renders part, so the rest keeps pixels
+    // rendered at an earlier moment — and the compositor alternates swapchain
+    // buffers holding those two moments. Undimmed the two are near enough to be
+    // invisible; dimming widens the gap between them and the boundary row
+    // visibly toggles between two values.
+    //
+    // That used to be a damageEntire() right here. Damage raised inside a frame
+    // schedules the NEXT frame, so any terminal on screen kept its monitor
+    // rendering at the full refresh rate forever (165 + 144 fps here, ~37% of
+    // the plugin's GPU time, measured 2026-10-21). Now render.pre (main.cpp)
+    // adds the whole box to frames that are about to render anyway, and the
+    // shimmer clock paces the frames the smoothed reading needs to settle.
+    // This only records that the glass is on screen.
+    if (adaptiveApplies())
+        m_lastAdaptiveDraw = std::chrono::steady_clock::now();
 
     CGlassPassElement::SGlassPassData data{m_self, alpha};
     g_pHyprRenderer->m_renderPass.add(makeUnique<CGlassPassElement>(data));
@@ -184,7 +185,7 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
     float blurStrength   = resolvePresetFloat(ctx, &SPresetValues::blurStrength, &SOverridableConfig::blurStrength);
     int downscale        = GlassRenderer::blurDownscale(blurStrength);
 
-    GlassRenderer::sampleBackground(m_sampleFramebuffer, source, transformBox, m_samplePaddingRatio, downscale);
+    GlassRenderer::sampleBackground(m_sampleFramebuffer, m_sampleHalfFramebuffer, source, transformBox, m_samplePaddingRatio, downscale);
 
     float blurRadius     = blurStrength * 12.0f / downscale;
     int blurIterations   = std::clamp(static_cast<int>(resolvePresetInt(ctx, &SPresetValues::blurIterations, &SOverridableConfig::blurIterations)), 1, 5);
@@ -233,10 +234,39 @@ void CGlassDecoration::updateWindow(PHLWINDOW window) {
     damageEntire();
 }
 
+bool CGlassDecoration::adaptiveApplies() const {
+    const auto& cfg = g_pGlobalState->config;
+    if (!cfg.adaptiveTint || **cfg.adaptiveTint <= 0.001f)
+        return false;
+    const bool termOnly = cfg.adaptiveTintTerminalsOnly && **cfg.adaptiveTintTerminalsOnly;
+    const auto w        = m_window.lock();
+    return !termOnly || !w || isTerminalClass(w->m_class);
+}
+
+bool CGlassDecoration::adaptiveActive() const {
+    const auto w = m_window.lock();
+    return w && w->m_isMapped && adaptiveApplies() &&
+        std::chrono::steady_clock::now() - m_lastAdaptiveDraw < std::chrono::seconds(1);
+}
+
+void CGlassDecoration::damageGlassOn(PHLMONITOR monitor) {
+    CBox box = glassDamageBox();
+    if (!monitor || box.empty())
+        return;
+    box.translate(-monitor->m_position).scale(monitor->m_scale).round();
+    monitor->m_damage.damage(box);
+}
+
 void CGlassDecoration::damageEntire() {
+    const CBox box = glassDamageBox();
+    if (!box.empty())
+        g_pHyprRenderer->damageBox(box);
+}
+
+CBox CGlassDecoration::glassDamageBox() const {
     const auto window = m_window.lock();
     if (!window)
-        return;
+        return {};
 
     const auto workspace = window->m_workspace;
     auto surfaceBox = window->getWindowMainSurfaceBox();
@@ -253,8 +283,7 @@ void CGlassDecoration::damageEntire() {
     const auto monitor = window->m_monitor.lock();
     const float scale = monitor ? monitor->m_scale : 1.0f;
     surfaceBox.expand(GlassRenderer::SAMPLE_PADDING_PX / scale);
-
-    g_pHyprRenderer->damageBox(surfaceBox);
+    return surfaceBox;
 }
 
 eDecorationLayer CGlassDecoration::getDecorationLayer() {

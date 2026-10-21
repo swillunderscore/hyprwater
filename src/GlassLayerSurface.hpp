@@ -18,6 +18,9 @@ class CGlassLayerSurface {
     void compositeAndRestore(PHLMONITOR monitor, float alpha);
 
     void damageIfMoved();
+    // Redraw this layer's glass whole (the water clock: water moves without
+    // anything on the layer changing).
+    void damageGlass();
 
     [[nodiscard]] PHLLS getLayerSurface() const;
 
@@ -29,6 +32,7 @@ class CGlassLayerSurface {
   private:
     PHLLSREF     m_layerSurface;
     SP<Render::IFramebuffer> m_sampleFramebuffer;
+    SP<Render::IFramebuffer> m_sampleHalfFramebuffer;   // see sampleBackground()
     SP<Render::IFramebuffer> m_surfaceTempFramebuffer;
     // Per-layer blur ping-pong scratch — see blurBackground(); must not be shared.
     SP<Render::IFramebuffer> m_blurTempFramebuffer;

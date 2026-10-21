@@ -77,6 +77,26 @@ PHLLS CGlassLayerSurface::getLayerSurface() const {
     return m_layerSurface.lock();
 }
 
+void CGlassLayerSurface::damageGlass() {
+    const auto layerSurface = m_layerSurface.lock();
+    if (!layerSurface || !layerSurface->m_mapped)
+        return;
+    const auto position = layerSurface->positionAnimation()->value();
+    const auto size     = layerSurface->sizeAnimation()->value();
+    if (size.x <= 0.0 || size.y <= 0.0 || !std::isfinite(position.x) || !std::isfinite(position.y) ||
+        !std::isfinite(size.x) || !std::isfinite(size.y))
+        return;
+    // Only on a monitor that is presenting: damage on a DPMS-off output would
+    // keep it awake for water nobody can see.
+    const auto monitor = layerSurface->m_monitor.lock();
+    if (!monitor || !monitor->m_enabled || !monitor->m_dpmsStatus)
+        return;
+    auto box = CBox{position, size};
+    box.expand(GlassRenderer::SAMPLE_PADDING_PX / monitor->m_scale).noNegativeSize();
+    if (box.w > 0.0 && box.h > 0.0)
+        g_pHyprRenderer->damageBox(box);
+}
+
 void CGlassLayerSurface::damageIfMoved() {
     const auto layerSurface = m_layerSurface.lock();
     if (!layerSurface)
@@ -167,7 +187,7 @@ void CGlassLayerSurface::sampleAndRedirect(PHLMONITOR monitor, float alpha) {
         float blurStrength   = resolvePresetFloat(ctx, &SPresetValues::blurStrength, &SOverridableConfig::blurStrength);
         int downscale        = GlassRenderer::blurDownscale(blurStrength);
 
-        GlassRenderer::sampleBackground(m_sampleFramebuffer, source, transformBox, m_samplePaddingRatio, downscale);
+        GlassRenderer::sampleBackground(m_sampleFramebuffer, m_sampleHalfFramebuffer, source, transformBox, m_samplePaddingRatio, downscale);
 
         float blurRadius     = blurStrength * 12.0f / downscale;
         int blurIterations   = std::clamp(static_cast<int>(resolvePresetInt(ctx, &SPresetValues::blurIterations, &SOverridableConfig::blurIterations)), 1, 5);

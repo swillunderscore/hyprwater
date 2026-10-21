@@ -290,18 +290,46 @@ static void shimmerTick(SP<CEventLoopTimer> self, void*) {
                 g_pHyprRenderer->damageWindow(w, true);
         }
 
-        // 0.56 moved the monitor list off CCompositor into the state tracker;
-        // g_pCompositor->m_monitors no longer exists.
-        for (const auto& monitor : State::monitorState()->monitors()) {
-            // Only monitors that are actually presenting. Damaging a DPMS-off
-            // or unplugged output would keep it awake for an effect nobody can
-            // see, and on a laptop that is a battery leak with no visible cause.
-            if (monitor && monitor->m_enabled)
-                g_pHyprRenderer->damageMonitor(monitor);
+        // Glass LAYERS (the bar, the pie, wofi) have no window to damage; redraw
+        // each one's own box. This used to damage every enabled monitor whole,
+        // which redrew the wallpaper and every opaque window on both screens 60
+        // times a second for nothing — the glass is all that moves.
+        for (auto& [ls, glassLayer] : g_pGlobalState->layerSurfaces) {
+            if (glassLayer)
+                glassLayer->damageGlass();
         }
     }
 
-    self->updateTimeout(std::chrono::milliseconds(on ? 16 : 500));
+    // Adaptive tint, water off: the smoothed backdrop reading only advances on
+    // frames that draw the glass, so after a change it needs frames to settle.
+    // ~30 a second is plenty for a 2 s average; this used to run at the full
+    // refresh rate on every monitor with a terminal (see CGlassDecoration::draw).
+    // "Active" means drawn in the last second, so a window that hasn't been
+    // drawn since the tint was switched on (or to terminals-only and back) would
+    // never start. Turning either setting redraws every glass once to kick it.
+    static float lastAdaptive = -1.f, lastTermOnly = -1.f;
+    const float  adaptiveNow  = cfg.adaptiveTint ? static_cast<float>(**cfg.adaptiveTint) : 0.f;
+    const float  termOnlyNow  = cfg.adaptiveTintTerminalsOnly ? static_cast<float>(**cfg.adaptiveTintTerminalsOnly) : 0.f;
+    const bool   kick         = adaptiveNow != lastAdaptive || termOnlyNow != lastTermOnly;
+    lastAdaptive = adaptiveNow;
+    lastTermOnly = termOnlyNow;
+
+    bool adaptive = false;
+    if (g_pHyprRenderer) {
+        for (auto& deco : g_pGlobalState->decorations) {
+            if (!deco)
+                continue;
+            const auto w = deco->getOwner();
+            if (kick && w && w->m_isMapped)
+                deco->damageEntire();
+            else if (!on && deco->adaptiveActive()) {
+                deco->damageEntire();
+                adaptive = true;
+            }
+        }
+    }
+
+    self->updateTimeout(std::chrono::milliseconds(on ? 16 : adaptive ? 33 : 500));
 }
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -350,6 +378,18 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     static auto onRenderStage = Event::bus()->m_events.render.stage.listen([&](eRenderStage stage) {
         if (stage == RENDER_BEGIN)
             g_pGlobalState->renderFrame++;
+    });
+
+    // Adaptive tint: a frame about to render ANYTHING on this monitor redraws
+    // every adaptive-tinted glass whole (why: CGlassDecoration::draw). render.pre
+    // fires before Hyprland reads the frame's damage, so this joins the frame
+    // instead of scheduling another. A frame with no damage stays a no-op.
+    static auto onRenderPre = Event::bus()->m_events.render.pre.listen([&](PHLMONITOR monitor) {
+        if (!g_pGlobalState || !monitor || !monitor->m_damage.hasChanged())
+            return;
+        for (auto& deco : g_pGlobalState->decorations)
+            if (deco && deco->adaptiveActive())
+                deco->damageGlassOn(monitor);
     });
 
     static auto onMouseButton = Event::bus()->m_events.input.mouse.button.listen(
@@ -481,6 +521,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     g_pGlobalState->fluidPrsCurrent = 0;
     g_pGlobalState->trailFb.reset();
     g_pGlobalState->causticFb.reset();
+    g_pGlobalState->slopeFb.reset();
     g_pGlobalState->causticTmpFb.reset();
 
     g_pHyprRenderer->m_renderPass.removeAllOfType("CGlassPassElement");

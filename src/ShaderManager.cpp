@@ -8,8 +8,22 @@
 #include <hyprland/src/render/OpenGL.hpp>
 
 std::string CShaderManager::loadShaderSource(const char* fileName) {
-    if (SHADERS.contains(fileName))
-        return SHADERS.at(fileName);
+    if (SHADERS.contains(fileName)) {
+        // GLSL ES has no #include. A line `#include "name"` is replaced by the
+        // SHADERS entry of that name, so code two programs must agree on
+        // (waveread.glsl) exists once.
+        std::string src = SHADERS.at(fileName);
+        for (size_t at = src.find("#include \""); at != std::string::npos; at = src.find("#include \"", at)) {
+            const size_t nameStart = at + 10;
+            const size_t nameEnd   = src.find('"', nameStart);
+            const size_t lineEnd   = src.find('\n', at);
+            if (nameEnd == std::string::npos)
+                break;
+            src.replace(at, (lineEnd == std::string::npos ? src.size() : lineEnd) - at,
+                        loadShaderSource(src.substr(nameStart, nameEnd - nameStart).c_str()));
+        }
+        return src;
+    }
 
     const std::string message = std::format("[{}] Failed to load shader: {}", PLUGIN_NAME, fileName);
     HyprlandAPI::addNotification(PHANDLE, message, CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
@@ -42,6 +56,10 @@ bool CShaderManager::compileGlassShader() {
     glassUniforms.waveTexel                = glGetUniformLocation(program, "waveTexel");
     glassUniforms.waveSmoothTex            = glGetUniformLocation(program, "waveSmoothTex");
     glassUniforms.waveSmoothTexel          = glGetUniformLocation(program, "waveSmoothTexel");
+    glassUniforms.slopeTex                 = glGetUniformLocation(program, "slopeTex");
+    glassUniforms.slopeOrigin              = glGetUniformLocation(program, "slopeOrigin");
+    glassUniforms.slopeCell                = glGetUniformLocation(program, "slopeCell");
+    glassUniforms.slopeSize                = glGetUniformLocation(program, "slopeSize");
     glassUniforms.causticK                 = glGetUniformLocation(program, "causticK");
     glassUniforms.winWake                  = glGetUniformLocation(program, "winWake");
     glassUniforms.winRectSim               = glGetUniformLocation(program, "winRectSim");
@@ -98,6 +116,33 @@ bool CShaderManager::compileAdaptiveLumaShader() {
     adaptiveLumaUniforms.prevTex  = glGetUniformLocation(program, "prevTex");
     adaptiveLumaUniforms.emaAlpha = glGetUniformLocation(program, "emaAlpha");
     adaptiveLumaUniforms.seedPrev = glGetUniformLocation(program, "seedPrev");
+    return true;
+}
+
+bool CShaderManager::compileSlopeShader() {
+    if (!slopeShader->createProgram(
+            g_pHyprOpenGL->m_shaders->TEXVERTSRC,
+            loadShaderSource("waveslope.frag"),
+            true
+        )) {
+        HyprlandAPI::addNotification(PHANDLE,
+            std::format("[{}] Failed to compile wave slope shader", PLUGIN_NAME),
+            CHyprColor{1.0, 0.2, 0.2, 1.0}, 5000);
+        return false;
+    }
+    const auto program = slopeShader->program();
+    slopeUniforms.waveSmoothTex   = glGetUniformLocation(program, "waveSmoothTex");
+    slopeUniforms.waveSmoothTexel = glGetUniformLocation(program, "waveSmoothTexel");
+    slopeUniforms.trailTex        = glGetUniformLocation(program, "trailTex");
+    slopeUniforms.velTexG         = glGetUniformLocation(program, "velTexG");
+    slopeUniforms.flowShift       = glGetUniformLocation(program, "flowShift");
+    slopeUniforms.waveSubFrac     = glGetUniformLocation(program, "waveSubFrac");
+    slopeUniforms.waveBias        = glGetUniformLocation(program, "waveBias");
+    slopeUniforms.winWake         = glGetUniformLocation(program, "winWake");
+    slopeUniforms.deskSize        = glGetUniformLocation(program, "deskSize");
+    slopeUniforms.shimmerScale    = glGetUniformLocation(program, "shimmerScale");
+    slopeUniforms.slopeOrigin     = glGetUniformLocation(program, "slopeOrigin");
+    slopeUniforms.slopeCell       = glGetUniformLocation(program, "slopeCell");
     return true;
 }
 
@@ -188,6 +233,8 @@ bool CShaderManager::compileCausticShader() {
     causticUniforms.waveSubFrac = glGetUniformLocation(program, "waveSubFrac");
     causticUniforms.waveBias    = glGetUniformLocation(program, "waveBias");
     causticUniforms.gridN       = glGetUniformLocation(program, "gridN");
+    causticUniforms.gridOrigin  = glGetUniformLocation(program, "gridOrigin");
+    causticUniforms.gridW       = glGetUniformLocation(program, "gridW");
     causticUniforms.flowShift   = glGetUniformLocation(program, "flowShift");
     causticUniforms.causticK    = glGetUniformLocation(program, "causticK");
     return true;
@@ -256,6 +303,9 @@ void CShaderManager::initializeIfNeeded() {
     if (!compileCausticShader())
         return;
 
+    if (!compileSlopeShader())
+        return;
+
     m_initialized = true;
 }
 
@@ -265,6 +315,7 @@ void CShaderManager::destroy() noexcept {
     waveSimShader->destroy();
     trailShader->destroy();
     causticShader->destroy();
+    slopeShader->destroy();
     fluidAdvectShader->destroy();
     fluidDivergenceShader->destroy();
     fluidJacobiShader->destroy();
