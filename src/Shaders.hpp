@@ -184,6 +184,10 @@ uniform float tintAlpha;
 uniform float adaptiveTint;
 uniform float adaptiveTarget;
 uniform sampler2D adaptiveLumaTex;   // 1x1: window-average backdrop luma, time-smoothed
+// White glass (adaptive_white): LIFT toward white until the window average
+// reaches adaptiveWhiteTarget, for dark text, instead of dimming for light text.
+uniform float adaptiveWhite;
+uniform float adaptiveWhiteTarget;
 uniform float lensDistortion;
 uniform float brightness;
 uniform float contrast;
@@ -857,14 +861,24 @@ void main() {
     // its animation turns into a shimmering fringe on every window edge.
     // Sunglasses dim the glints too.
     float adaptiveScale = 1.0;
+    float adaptiveLift  = 0.0;
     if (adaptiveTint > 0.001) {
         // ONE value for the whole window: pre-averaged and time-smoothed in a
         // 1x1 texture (adaptiveluma.frag), so it is identical for every fragment
         // and identical content always renders identically.
         float lAvg = texture(adaptiveLumaTex, vec2(0.5)).r * brightness;
         if (isnan(lAvg) || isinf(lAvg)) lAvg = 0.0;  // adaptiveluma.frag heals it next frame
-        float dim  = clamp(adaptiveTarget / max(lAvg, 1e-4), 0.0, 1.0);
-        adaptiveScale = mix(1.0, dim, adaptiveTint);
+        if (adaptiveWhite > 0.5) {
+            // White glass. Here mixing toward white IS the look asked for (frosted
+            // white, dark text) — unlike the dim, where it read as grey murk. One
+            // uniform amount, solved so the average lands on the target:
+            // l + (1 - l) * w = target. Already brighter = left alone.
+            float w = clamp((adaptiveWhiteTarget - lAvg) / max(1.0 - lAvg, 1e-4), 0.0, 1.0);
+            adaptiveLift = w * adaptiveTint;
+        } else {
+            float dim  = clamp(adaptiveTarget / max(lAvg, 1e-4), 0.0, 1.0);
+            adaptiveScale = mix(1.0, dim, adaptiveTint);
+        }
     }
 
     // Applied to the BACKDROP, before the caustic shimmer and the
@@ -1191,6 +1205,9 @@ void main() {
     // than the 2px transparent border, so it does not read as a ring.
     float dimFade = smoothstep(0.85, 1.0, cornerAlpha);
     color *= mix(1.0, adaptiveScale, dimFade);
+    // White glass lifts last for the same reason the dim scales last: the
+    // glints and rim wash out with it, like frost on the glass.
+    color = mix(color, vec3(1.0), adaptiveLift * dimFade);
 
     float glassA = glassOpacity * cornerAlpha;
 

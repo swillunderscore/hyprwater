@@ -307,12 +307,14 @@ static void shimmerTick(SP<CEventLoopTimer> self, void*) {
     // "Active" means drawn in the last second, so a window that hasn't been
     // drawn since the tint was switched on (or to terminals-only and back) would
     // never start. Turning either setting redraws every glass once to kick it.
-    static float lastAdaptive = -1.f, lastTermOnly = -1.f;
+    static float lastAdaptive = -1.f, lastTermOnly = -1.f, lastWhite = -1.f;
     const float  adaptiveNow  = cfg.adaptiveTint ? static_cast<float>(**cfg.adaptiveTint) : 0.f;
     const float  termOnlyNow  = cfg.adaptiveTintTerminalsOnly ? static_cast<float>(**cfg.adaptiveTintTerminalsOnly) : 0.f;
-    const bool   kick         = adaptiveNow != lastAdaptive || termOnlyNow != lastTermOnly;
+    const float  whiteNow     = cfg.adaptiveWhite ? static_cast<float>(**cfg.adaptiveWhite) : 0.f;
+    const bool   kick         = adaptiveNow != lastAdaptive || termOnlyNow != lastTermOnly || whiteNow != lastWhite;
     lastAdaptive = adaptiveNow;
     lastTermOnly = termOnlyNow;
+    lastWhite    = whiteNow;
 
     bool adaptive = false;
     if (g_pHyprRenderer) {

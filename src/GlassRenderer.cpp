@@ -2001,7 +2001,7 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
                        float alpha, float cornerRadius, float roundingPower,
                        const Vector2D& paddingRatio, const SResolveContext& resolveContext,
                        const SMaskInfo* mask, SP<Render::IFramebuffer> adaptiveLumaFb,
-                       bool tintAllowed) {
+                       bool tintAllowed, bool whiteAllowed) {
     // ONE scissor guard for the ENTIRE effect, raw GL, not the compositor's
     // cached cap wrapper (the cache can disagree with real state and skip the
     // disable). The render pass leaves a damage-rect scissor enabled; every
@@ -2408,6 +2408,14 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
             (haveLuma && cfgAd.adaptiveTint) ? static_cast<float>(**cfgAd.adaptiveTint) : 0.0f);
         glUniform1f(uniforms.adaptiveTarget,
             cfgAd.adaptiveTarget ? static_cast<float>(**cfgAd.adaptiveTarget) : 0.18f);
+        // White glass only ever on terminal windows (whiteAllowed), whatever
+        // "terminals only" says: its point is dark TEXT, and only a terminal's
+        // text gets switched to dark — any other window would go white under
+        // its own light text.
+        glUniform1f(uniforms.adaptiveWhite,
+            (whiteAllowed && cfgAd.adaptiveWhite && **cfgAd.adaptiveWhite) ? 1.0f : 0.0f);
+        glUniform1f(uniforms.adaptiveWhiteTarget,
+            cfgAd.adaptiveWhiteTarget ? static_cast<float>(**cfgAd.adaptiveWhiteTarget) : 0.78f);
         glUniform1i(uniforms.adaptiveLumaTex, 4);
         if (haveLuma) {
             glActiveTexture(GL_TEXTURE4);

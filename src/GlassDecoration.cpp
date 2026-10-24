@@ -223,7 +223,8 @@ void CGlassDecoration::renderPass(PHLMONITOR monitor, const float& alpha) {
     GlassRenderer::applyGlassEffect(m_sampleFramebuffer, source,
                                      windowBox, transformBox, alpha,
                                      cornerRadius, roundingPower, m_samplePaddingRatio, ctx,
-                                     nullptr, adaptiveLumaFb, tintAllowed);
+                                     nullptr, adaptiveLumaFb, tintAllowed,
+                                     isTerminalClass(window->m_class));
 }
 
 eDecorationType CGlassDecoration::getDecorationType() {

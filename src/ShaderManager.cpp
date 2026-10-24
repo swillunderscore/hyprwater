@@ -83,6 +83,8 @@ bool CShaderManager::compileGlassShader() {
     glassUniforms.tintAlpha           = glGetUniformLocation(program, "tintAlpha");
     glassUniforms.adaptiveTint         = glGetUniformLocation(program, "adaptiveTint");
     glassUniforms.adaptiveTarget       = glGetUniformLocation(program, "adaptiveTarget");
+    glassUniforms.adaptiveWhite        = glGetUniformLocation(program, "adaptiveWhite");
+    glassUniforms.adaptiveWhiteTarget  = glGetUniformLocation(program, "adaptiveWhiteTarget");
     glassUniforms.adaptiveLumaTex      = glGetUniformLocation(program, "adaptiveLumaTex");
     glassUniforms.lensDistortion      = glGetUniformLocation(program, "lensDistortion");
     glassUniforms.saturation          = glGetUniformLocation(program, "saturation");

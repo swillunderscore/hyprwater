@@ -84,6 +84,18 @@ The glass (from HyprGlass, with `dark:`/`light:` theme variants for each):
 `tint_color`, `lens_distortion`, `saturation`, `brightness`, `contrast`,
 `vibrancy`, `vibrancy_darkness`, `adaptive_dim`, `adaptive_boost`.
 
+Readability (one time-smoothed average per window, so it doesn't pump with an
+animated wallpaper):
+
+| Key | Default | What it does |
+|---|---|---|
+| `adaptive_tint` | 0 | strength; dims the backdrop until the window average is `adaptive_target` |
+| `adaptive_target` | 0.18 | average luma to dim down to (for light text) |
+| `adaptive_speed` | 2.0 | seconds to settle |
+| `adaptive_tint_terminals_only` | 0 | 1 = only terminal windows get it |
+| `adaptive_white` | 0 | 1 = white glass: terminal windows LIFT toward white instead, for dark text |
+| `adaptive_white_target` | 0.78 | average luma white glass lifts to |
+
 Layer surfaces: `layers:enabled`, `layers:namespaces`,
 `layers:exclude_namespaces`, `layers:namespace_presets`,
 `layers:namespace_mask_thresholds`, `layers:preset`.
@@ -97,6 +109,12 @@ per window rule (`tag:hyprwater_preset_<name>`) or per layer namespace.
 
 - `plugin:hyprwater:adaptive_boost`
 - `plugin:hyprwater:adaptive_dim`
+- `plugin:hyprwater:adaptive_speed`
+- `plugin:hyprwater:adaptive_target`
+- `plugin:hyprwater:adaptive_tint`
+- `plugin:hyprwater:adaptive_tint_terminals_only`
+- `plugin:hyprwater:adaptive_white`
+- `plugin:hyprwater:adaptive_white_target`
 - `plugin:hyprwater:blur_iterations`
 - `plugin:hyprwater:blur_strength`
 - `plugin:hyprwater:brightness`

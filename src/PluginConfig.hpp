@@ -54,6 +54,11 @@ inline constexpr auto TINT_COLOR           = "plugin:hyprwater:tint_color";
 // applies). This is the passive/live replacement for polling the screen.
 inline constexpr auto ADAPTIVE_TINT          = "plugin:hyprwater:adaptive_tint";
 inline constexpr auto ADAPTIVE_TARGET        = "plugin:hyprwater:adaptive_target";
+// White glass: the adaptive tint LIFTS the backdrop toward white until its
+// window average reaches `adaptive_white_target`, for dark terminal text,
+// instead of dimming it for light text. Same per-window average, same speed.
+inline constexpr auto ADAPTIVE_WHITE         = "plugin:hyprwater:adaptive_white";
+inline constexpr auto ADAPTIVE_WHITE_TARGET  = "plugin:hyprwater:adaptive_white_target";
 // Restrict adaptive tint to terminal windows (by WM class). 1 = terminals
 // only, 0 = all windows (default, prior behaviour).
 inline constexpr auto ADAPTIVE_TINT_TERMINALS_ONLY = "plugin:hyprwater:adaptive_tint_terminals_only";
@@ -237,6 +242,8 @@ struct SPluginConfig {
     Hyprlang::FLOAT* const* adaptiveTarget              = nullptr;
     Hyprlang::FLOAT* const* adaptiveSpeed               = nullptr;
     Hyprlang::INT* const*   adaptiveTintTerminalsOnly   = nullptr;
+    Hyprlang::INT* const*   adaptiveWhite               = nullptr;
+    Hyprlang::FLOAT* const* adaptiveWhiteTarget         = nullptr;
     Hyprlang::FLOAT* const* shimmerIntensity            = nullptr;
     Hyprlang::FLOAT* const* shimmerSpeed                = nullptr;
     Hyprlang::FLOAT* const* shimmerScale                = nullptr;

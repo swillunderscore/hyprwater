@@ -118,6 +118,7 @@ void applyGlassEffect(SP<Render::IFramebuffer> sampleFramebuffer, SP<Render::IFr
                        const Vector2D& paddingRatio, const SResolveContext& resolveContext,
                        const SMaskInfo* mask = nullptr,
                        SP<Render::IFramebuffer> adaptiveLumaFb = nullptr,
-                       bool tintAllowed = true);
+                       bool tintAllowed = true,
+                       bool whiteAllowed = false);
 
 } // namespace GlassRenderer
