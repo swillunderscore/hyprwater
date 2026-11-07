@@ -1,3 +1,6 @@
 *.o
 *.d
 *.so
+
+# Claude Code's per-machine permission rules (can hold typed secrets)
+**/.claude/settings.local.json
